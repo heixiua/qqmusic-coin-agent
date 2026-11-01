@@ -70,6 +70,8 @@ UA_EXCLUDE_KEYWORDS = [
     "去购物", "去app", "去应用", "立即下载",
     "定时领金币", "去翻卡", "翻卡", "领额外奖励", "每日免费抽奖",
     "去浏览", "去看看", "去添加", "去听歌", "免费领",
+    "每日可以获得", "看视频机会",                     # 金币页提示文字"每日可以获得20次看视频机会..."不是按钮, 排除误命中
+    "领金币",                                     # 金币页活动区任务行右侧的"领金币"按钮一律不点(只有看视频领金币板块内的AI视觉区分)
 ]
 # ==========================================
 
@@ -315,7 +317,6 @@ def uia_detect_click():
             log(f"[硬编码] 检测到浮层特征[{_ft}], 转AI视觉判断")
             return None
     click_hits = []   # (面积, cx, cy, txt, kw)
-    any_hits = []
     for m in re.finditer(r'<node[^>]*>', xml):
         node = m.group(0)
         t = re.search(r'text="([^"]*)"', node)
@@ -337,20 +338,15 @@ def uia_detect_click():
         cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
         clickable = re.search(r'clickable="([^"]*)"', node)
         area = w * h
+        # 只收真正clickable的按钮(广告闭环弹窗/原生按钮). 金币页任务列表是WebView,
+        # 非clickable文本节点bounds不可靠(全部堆叠在同一行), 硬编码点击必然无效, 一律转AI视觉定位
         if clickable and clickable.group(1) == "true":
             click_hits.append((area, cx, cy, txt, kw))
-        else:
-            any_hits.append((area, cx, cy, txt, kw))
-    # 优先可点击节点中面积最大的(真正的任务按钮); 无则退回任意命中中面积最大的(父容器可点)
+    # 优先可点击节点中面积最大的(真正的任务按钮)
     if click_hits:
         click_hits.sort(key=lambda x: x[0], reverse=True)
         _, cx, cy, txt, kw = click_hits[0]
         log(f"[硬编码命中] 可点击节点 文本={txt[:26]} 命中={kw} 坐标({cx},{cy})")
-        return cx, cy
-    if any_hits:
-        any_hits.sort(key=lambda x: x[0], reverse=True)
-        _, cx, cy, txt, kw = any_hits[0]
-        log(f"[硬编码命中] 非clickable节点(父容器可点) 文本={txt[:26]} 命中={kw} 坐标({cx},{cy})")
         return cx, cy
     return None
 
