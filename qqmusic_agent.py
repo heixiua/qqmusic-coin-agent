@@ -300,12 +300,22 @@ def uia_detect_click():
         return None
     if not xml or "<node" not in xml:
         return None
-    # ===== 浮层检测: 转盘/抽奖类浮层盖住金币页时, dump拿不到浮层自己的按钮(WebView), 反而命中下层无效节点
-    # 命中这些特征说明当前是浮层页面, 直接交给AI视觉(截图能看到浮层真实按钮)
-    for _ft in ("幸运大转盘", "今日剩余抽奖次数", "每日首次", "免费抽奖", "转盘"):
-        if _ft in xml:
-            log(f"[硬编码] 检测到浮层特征[{_ft}], 转AI视觉判断")
+    # ===== 转盘浮层检测(100轮测试修正): 只有【今日剩余抽奖次数】是转盘页专属特征 =====
+    # 金币页任务卡本身带【幸运大转盘】字样, 之前用它是误伤(正常金币页也被转AI, 白白烧API)
+    # 转盘页按钮在WebView里dump拿不到坐标, 但100轮测试AI输出坐标高度稳定, 直接固化
+    if "今日剩余抽奖次数" in xml:
+        global _popup_cycle
+        _popup_cycle += 1
+        if _popup_cycle >= 8:
+            _popup_cycle = 0
+            log("[硬编码] 转盘浮层已知按钮连续无效, 转AI视觉兜底")
             return None
+        # 已知按钮坐标表(来自100轮测试AI输出统计, 相对固定): 浏览5秒再领/观看下一条/免费抽奖
+        _known = [(543, 1248, "浏览5秒再领"), (540, 1400, "观看下一条"), (538, 1188, "转盘免费抽奖")]
+        cx, cy, label = _known[_popup_cycle % 3]
+        log(f"[硬编码] 转盘浮层, 尝试已知按钮[{label}] 坐标({cx},{cy})")
+        return (cx, cy)
+    _popup_cycle = 0
     click_hits = []   # (面积, cx, cy, txt, kw)
     any_hits = []
     for m in re.finditer(r'<node[^>]*>', xml):
@@ -454,11 +464,12 @@ def main():
     if not Path(ADB).exists():
         log(f"!! adb 路径不存在: {ADB}")
         sys.exit(1)
-    global _last_had_click, _last_uia_pos, _last_uia_time, _uia_streak
+    global _last_had_click, _last_uia_pos, _last_uia_time, _uia_streak, _popup_cycle
     _last_had_click = False
     _last_uia_pos = None      # 上一次硬编码点击的坐标(防卡死用)
     _last_uia_time = 0.0      # 上一次硬编码点击的时间戳
     _uia_streak = 0           # 同一按钮连续命中计数(>=2 即第3次 -> 下滑换任务)
+    _popup_cycle = 0          # 转盘浮层已知按钮轮换计数(>=8 转AI兜底)
 
     # 支持命令行传轮数: python qqmusic_agent.py 5 (试跑5轮)
     rounds = MAX_ROUNDS
@@ -619,7 +630,7 @@ def main():
                 adb_back()
                 time.sleep(1.5)
             ad_state = AD_IDLE
-            _last_uia_pos = None; _uia_streak = 0   # 重置防卡死(页面已变)
+            _last_uia_pos = None; _uia_streak = 0; _popup_cycle = 0   # 重置防卡死(页面已变)
             time.sleep(random.uniform(3, 6))
             continue
 
@@ -635,7 +646,7 @@ def main():
         if ad_state != AD_IDLE:
             log("[状态机] 已离开广告Activity, 复位")
             ad_state = AD_IDLE
-            _last_uia_pos = None; _uia_streak = 0   # 重置防卡死(页面已变)
+            _last_uia_pos = None; _uia_streak = 0; _popup_cycle = 0   # 重置防卡死(页面已变)
 
         # 兜底1: 连续多次WAIT说明可能卡在某个页面, 强制返回一次
         if wait_streak >= 3:
