@@ -102,8 +102,9 @@ SYSTEM_PROMPT = (
     "- 屏幕任务全部不可点/已领过/只剩用户自己刷的任务: {\"action\":\"SWIPE\",\"reason\":\"下滑看更多\"}\n"
     "- 拿不准: {\"action\":\"SWIPE\",\"reason\":\"不确定,下滑看看\"}\n"
     "- 【未知页面识别(重要)】截图既不是金币任务页、也不是广告奖励页(没有任务按钮列表), 而是以下形态时: "
-    "歌曲播放页/视频播放页(有播放进度条、暂停/播放按钮、歌曲名或视频画面)、空白引导页、加载页、异常页 → "
-    "{\"action\":\"BACK\",\"reason\":\"非金币页,返回\"}(播放页/视频页听满15秒金币自动到账, 直接返回即可)。\n"
+    "歌曲播放页/视频播放页(有播放进度条、暂停/播放按钮、歌曲名或视频画面) → "
+    "{\"action\":\"PLAY_WAIT\",\"reason\":\"播放页,听满15秒金币到账后再返回\"}; "
+    "空白引导页、加载页、异常页、其他无法判断页面 → {\"action\":\"BACK\",\"reason\":\"非金币页,返回\"}。\n"
     "严禁点击: 活动任务区、定时领金币/翻卡/听歌/分享/收藏/关注/红包雨/下载/领额外奖励类任务、任何带【去xx/打开xx/下载xx/免费领】字样的任务、广告页里的任何按钮(广告页状态机自动处理)。"
 )
 
@@ -134,6 +135,26 @@ AD_CLOSE_PROMPT = (
     "输出: {\"action\":\"CLICK\",\"x\":<0~1000>,\"y\":<0~1000>,\"reason\":\"点关闭按钮\"}\n"
     "注意: 严禁点击【立即咨询/了解详情/进入详情页/领取/查看价格】等广告跳转按钮(那是AD_ENTRY的活, 点了会重新进广告), 只点关闭/退出按钮。"
     "若截图看不到任何关闭/退出按钮: {\"action\":\"WAIT\",\"reason\":\"看不到关闭按钮\"}。只输出JSON。"
+)
+
+# watchdog 卡住自救专用prompt: 先保住奖励再退出, BACK只作最后手段
+RESCUE_PROMPT = (
+    "你是卡死自救Agent。脚本已连续10轮截图几乎不变(判定卡住), 现在要决定一次自救动作。"
+    "分析截图, 只输出一个JSON对象, 不要多余文字。\n"
+    "原则: 优先保住金币奖励, 能点按钮就不要退出; 尽量不BACK, BACK只作最后手段且只返回一次。\n"
+    "1. 金币页弹出【继续浏览可额外获得XX金币/浏览5秒再领/观看下一条/观看完成+金币】任务弹窗: "
+    "{\"action\":\"CLICK\",\"x\":<0~1000>,\"y\":<0~1000>,\"reason\":\"点继续浏览领奖励, 不要退出\"}。"
+    "点奖励按钮本身(继续浏览/立即领取/看视频), 严禁点X或返回, 否则丢奖励任务。\n"
+    "2. 金币任务页(有金币狂欢节/看视频领金币等任务列表)但没有可点任务: "
+    "{\"action\":\"SWIPE\",\"reason\":\"金币页下滑找任务\"}。\n"
+    "3. 广告页/H5详情页/广告弹窗(有广告内容、倒计时、恭喜获得奖励、右上角X/关闭/退出): "
+    "{\"action\":\"CLOSE\",\"x\":<0~1000>,\"y\":<0~1000>,\"reason\":\"点关闭X退出广告\"}。"
+    "只点关闭/退出按钮, 严禁点了解详情/立即咨询/下载等广告跳转按钮。\n"
+    "4. 歌曲播放页/视频播放页(专辑封面、播放进度条、暂停键、歌曲名): "
+    "{\"action\":\"PLAY_WAIT\",\"reason\":\"播放页,听满15秒再返回\"}。\n"
+    "5. 登录/注册/商品页/第三方App/空白页/其他无法判断: "
+    "{\"action\":\"BACK\",\"reason\":\"无法利用的页面, 返回一次\"}。\n"
+    "只输出JSON。"
 )
 
 def log(msg):
@@ -254,7 +275,8 @@ def call_vlm(img_b64, mode="normal"):
     mode: "normal"=金币页常规判断, "ad"=广告页按钮定位"""
     last_err = None
     sys_prompt = (AD_ENTRY_PROMPT if mode == "ad" else
-                  AD_CLOSE_PROMPT if mode == "close" else SYSTEM_PROMPT)
+                  AD_CLOSE_PROMPT if mode == "close" else
+                  RESCUE_PROMPT if mode == "rescue" else SYSTEM_PROMPT)
     for p in VLM_PROVIDERS:
         api_key = os.getenv(p["api_key_env"])
         if not api_key:
@@ -317,6 +339,27 @@ def adb_back():
 def adb_swipe_up():
     """向上滑动(查看下方任务); 用屏幕中下部滑到上部"""
     subprocess.run([ADB, "shell", "input", "swipe", "500", "1600", "500", "400", "500"], check=True)
+
+# ===== 播放页等待: 听满15秒金币才到账, 不能立刻BACK =====
+PLAY_WAIT_SECONDS = 15
+_play_wait_start = 0.0
+
+def play_wait_then_back(reason=""):
+    """播放页: 首轮开始计时, 等满PLAY_WAIT_SECONDS再BACK一次; 未满先等待. 返回PLAY_WAIT或BACK"""
+    global _play_wait_start
+    if _play_wait_start <= 0:
+        _play_wait_start = time.time()
+        log(f"[播放页] 检测到播放页, 开始计时(需听满{PLAY_WAIT_SECONDS}s) reason={reason}")
+    elapsed = time.time() - _play_wait_start
+    if elapsed < PLAY_WAIT_SECONDS:
+        remain = PLAY_WAIT_SECONDS - elapsed
+        log(f"[播放页] 已听{elapsed:.0f}s, 还需{remain:.0f}s, 先等待")
+        time.sleep(min(remain, random.uniform(5, 9)))
+        return "PLAY_WAIT"
+    log(f"[播放页] 已听满{elapsed:.0f}s, BACK返回(金币应已到账)")
+    adb_back()
+    _play_wait_start = 0.0
+    return "BACK"
 
 # 右上角关闭X的位置(相对坐标0~1000, 用户截图标定约925,107)
 CLOSE_X_REL, CLOSE_Y_REL = 925, 107
@@ -421,7 +464,7 @@ def _match_task_keyword(txt):
 
 def run_once():
     """单轮: 硬编码优先 -> 截屏识图兜底"""
-    global _last_had_click, _last_uia_pos, _last_uia_time, _uia_streak
+    global _last_had_click, _last_uia_pos, _last_uia_time, _uia_streak, _play_wait_start
     if random.random() < SKIP_PROB:
         w = random.uniform(4, 10)
         log(f"[跳过本轮] 随机暂停 {w:.1f}s")
@@ -433,6 +476,7 @@ def run_once():
     uia_hit = uia_detect_click()
     if uia_hit:
         cx, cy = uia_hit
+        _play_wait_start = 0.0   # 已回到金币页, 播放计时复位
         # ===== 防卡死: 同一按钮连续命中3次(45秒内, 间距<30px) -> 判定无效, 改下滑 =====
         now = time.time()
         if (_last_uia_pos is not None and
@@ -499,12 +543,19 @@ def run_once():
     elif act == "SWIPE":
         log(f"[下滑:{provider}] reason={reason}")
         adb_swipe_up()
+    elif act == "PLAY_WAIT":
+        # 播放页: 等满15秒金币到账再BACK, 不能立刻返回丢奖励
+        log(f"[播放页:{provider}] reason={reason}")
+        act = play_wait_then_back(reason)
     elif act == "BACK":
         log(f"[返回:{provider}] reason={reason}")
         adb_back()
         # BACK后如果还在广告页: 广告流程尚未走完, 交给主循环ad_streak判断是否重启, 不在此打断
     else:
         log(f"[等待:{provider}] reason={reason}")
+
+    if act != "PLAY_WAIT":
+        _play_wait_start = 0.0   # 页面已不是播放页, 计时复位
 
     w = random.uniform(WAIT_MIN, WAIT_MAX)
     log(f"[等待] {w:.1f}s")
@@ -518,8 +569,9 @@ def main():
     if not Path(ADB).exists():
         log(f"!! adb 路径不存在: {ADB}")
         sys.exit(1)
-    global _last_had_click, _last_uia_pos, _last_uia_time, _uia_streak
+    global _last_had_click, _last_uia_pos, _last_uia_time, _uia_streak, _play_wait_start
     _last_had_click = False
+    _play_wait_start = 0.0
     _last_uia_pos = None      # 上一次硬编码点击的坐标(防卡死用)
     _last_uia_time = 0.0      # 上一次硬编码点击的时间戳
     _uia_streak = 0           # 同一按钮连续命中计数(>=2 即第3次 -> 下滑换任务)
@@ -560,7 +612,8 @@ def main():
     ad_state = AD_IDLE
     ad_watch_start = 0.0   # 进入AD_WATCH的时间戳
     ad_close_streak = 0    # AD_CLOSE连续点X次数, >=2改BACK退出
-    AD_WATCH_SECONDS = 16  # 详情页需浏览秒数(15秒+1余量)
+    AD_WATCH_SECONDS = 16  # 详情页最少浏览秒数(15秒+1余量)
+    AD_WATCH_MAX_SECONDS = 45  # 30秒视频等长广告: AI说还没播完可继续等, 上限45秒(防止提前关闭丢金币)
 
     def ad_step(ow, oh):
         """广告状态机单步执行, 返回状态(是否仍需继续广告流程)"""
@@ -638,6 +691,11 @@ def main():
                 adb_back()
                 time.sleep(2)
                 ad_state = AD_BACK
+            elif act == "WAIT" and elapsed < AD_WATCH_MAX_SECONDS:
+                # 30秒视频/长广告还没播完(AI说看不清/仍在播放): 继续等, 不能16秒就关掉丢金币
+                log(f"[广告-视频未看完] 已等{elapsed:.0f}s, 继续等待(上限{AD_WATCH_MAX_SECONDS}s)")
+                time.sleep(random.uniform(3, 5))
+                return True
             else:
                 # 双路径退出: ①H5页面(如保险登录页)可BACK返回 ②咨询弹窗可点弹窗右上角X
                 log("[广告-详情页看完] 先BACK返回(处理H5页), 再点弹窗右上角X(处理弹窗)")
@@ -722,17 +780,53 @@ def main():
                 if _wd_streak >= WD_SIM_ROUNDS:
                     log(f"[watchdog] 连续{WD_SIM_ROUNDS}轮画面相似度>=90%, 判定卡住(画面未动)")
                     save_sample(n, "画面连续相似>=90%")
-                    # 自救: BACK + 强制下滑, 打破静止画面
-                    for _ in range(2):
-                        adb_back()
-                        time.sleep(1.5)
-                    adb_swipe_up()
                     _wd_streak = 0
                     _last_sig = None
                     _last_uia_pos = None; _uia_streak = 0
                     wait_streak = 0; swipe_streak = 0
-                    ad_state = AD_IDLE
                     _ad_wait_streak = 0
+                    # 自救: 先让AI看页面决定动作(优先点"继续浏览"保奖励/点X关闭, BACK只作最后手段且只1次)
+                    ract = "BACK"
+                    try:
+                        (wd_w, wd_h), wd_b64 = capture_and_encode()
+                        rescue = call_vlm(wd_b64, mode="rescue")
+                        ract = rescue.get("action", "BACK")
+                        log(f"[watchdog-自救] AI判断={ract} reason={rescue.get('reason','')}")
+                        if ract in ("CLICK", "CLOSE"):
+                            try:
+                                rx = float(rescue.get("x", 500)); ry = float(rescue.get("y", 500))
+                            except (TypeError, ValueError):
+                                rx, ry = 500, 500
+                            x = int(rx / 1000 * wd_w) + random.randint(-OFFSET, OFFSET)
+                            y = int(ry / 1000 * wd_h) + random.randint(-OFFSET, OFFSET)
+                            log(f"[watchdog-自救] 点击({x},{y})")
+                            adb_tap(x, y)
+                        elif ract == "SWIPE":
+                            adb_swipe_up()
+                        elif ract == "PLAY_WAIT":
+                            if play_wait_then_back("watchdog自救") == "BACK":
+                                ract = "BACK"   # 已听满15秒并BACK
+                        else:
+                            ract = "BACK"
+                            log("[watchdog-自救] BACK一次(最后手段)")
+                            adb_back()
+                    except Exception as e:
+                        log(f"[watchdog-自救AI失败] {str(e)[:40]}, BACK一次")
+                        ract = "BACK"
+                        adb_back()
+                    # 自救后状态衔接: 点X->交给关闭状态确认; BACK->确认是否离开广告; 其余回金币页流程
+                    if ract == "CLOSE":
+                        ad_close_streak = 0
+                        ad_state = AD_CLOSE
+                    elif ract == "BACK":
+                        ad_state = AD_BACK
+                    elif ract == "CLICK" and is_ad_activity():
+                        ad_state = AD_WATCH       # 点的是广告跳转/浏览按钮, 重新开始计时
+                        ad_watch_start = time.time()
+                    else:
+                        ad_state = AD_IDLE
+                    if ract != "PLAY_WAIT":
+                        _play_wait_start = 0.0
                     time.sleep(random.uniform(3, 6))
                     continue
         except Exception as e:
