@@ -113,9 +113,12 @@ AD_ENTRY_PROMPT = (
     "【立即咨询】也是合法的跳转按钮(进入保险H5/咨询详情页, 计时照常走, 看完BACK能退出), 不要因为含'咨询'就拒绝点它。\n"
     "1b. 页面弹出【点击后浏览15秒/点击立即浏览/立即浏览/开始浏览/浏览15秒可获得奖励】这类确认弹窗时: {\"action\":\"CLICK\",\"x\":X,\"y\":Y,\"reason\":\"点立即浏览开始计时\"}, "
     "点弹窗里最显眼的红色/主按钮【点击立即浏览】(不是灰色【放弃奖励】, 点了放弃就没有奖励)。\n"
+    "1c. 页面顶部有【点击商品可获得额外100金币/点击商品打开XX再得额外奖励/点击商品查看更多】这类浏览奖励横幅、下方是商品网格列表时: {\"action\":\"CLICK\",\"x\":X,\"y\":Y,\"reason\":\"点第一个商品卡进入详情页计时\"}, "
+    "点商品网格里最左上角的第一个商品卡片中心(不是横幅文字本身)。\n"
     "2. 页面有【恭喜已获得奖励/已获得奖励/已完成】提示(说明广告已看完): {\"action\":\"CLOSE\",\"reason\":\"广告已看完,点X关闭\"}。\n"
-    "3. 两种都不确定: {\"action\":\"WAIT\",\"reason\":\"看不清,再等等\"}。\n"
-    "严禁点击: 下载/立即打开/登录/购买/领券/打开微信客服(这些会跳第三方, 不领金币), 严禁输出BACK。只输出JSON。"
+    "3. 页面是【登录/注册/输入手机号验证码】类表单页(如京东登录页, 特征是手机号/验证码输入框+登录/注册按钮, 没有广告计时的跳转/浏览按钮): {\"action\":\"BACK\",\"reason\":\"登录表单页无广告计时入口,直接返回\"}。\n"
+    "4. 两种都不确定: {\"action\":\"WAIT\",\"reason\":\"看不清,再等等\"}。\n"
+    "严禁点击: 下载/立即打开/登录/注册/购买/领券/打开微信客服(这些会跳第三方, 不领金币), 严禁输出BACK(登录表单页除外, 见规则3)。只输出JSON。"
 )
 
 AD_CLOSE_PROMPT = (
@@ -464,6 +467,9 @@ def main():
     _last_uia_time = 0.0      # 上一次硬编码点击的时间戳
     _uia_streak = 0           # 同一按钮连续命中计数(>=2 即第3次 -> 下滑换任务)
 
+    global _ad_wait_streak    # 广告状态机内连续WAIT计数(登录页/无入口页兜底BACK)
+    _ad_wait_streak = 0
+
     # 支持命令行传轮数: python qqmusic_agent.py 5 (试跑5轮)
     rounds = MAX_ROUNDS
     if len(sys.argv) > 1:
@@ -514,15 +520,34 @@ def main():
                     adb_tap(x, y)
                     ad_state = AD_WATCH
                     ad_watch_start = time.time()
+                    _ad_wait_streak = 0
                     return True
                 elif act == "CLOSE":
                     # 模型看到"恭喜已获得奖励" → 直接进入关闭
                     log(f"[广告-已看完] {action.get('reason','')}")
                     ad_state = AD_CLOSE
+                    _ad_wait_streak = 0
+                    return True
+                elif act == "BACK":
+                    # 登录/注册表单页: 无广告计时入口, 直接返回(不用等)
+                    log(f"[广告-登录页] {action.get('reason','')} —— 直接BACK返回")
+                    adb_back()
+                    _ad_wait_streak = 0
+                    time.sleep(random.uniform(2, 3))
+                    ad_state = AD_BACK
                     return True
                 else:
-                    log(f"[广告-等待] {action.get('reason','')} —— 再等几秒")
-                    time.sleep(random.uniform(4, 7))
+                    # WAIT: 连续2次仍无入口(登录页/无意义页) -> 强制BACK, 避免空等
+                    _ad_wait_streak += 1
+                    log(f"[广告-等待] {action.get('reason','')} —— 再等几秒 ({_ad_wait_streak}/2)")
+                    if _ad_wait_streak >= 2:
+                        log("[广告-等待超限] 连续2次无跳转入口, 强制BACK返回")
+                        adb_back()
+                        _ad_wait_streak = 0
+                        time.sleep(random.uniform(2, 3))
+                        ad_state = AD_BACK
+                        return True
+                    time.sleep(random.uniform(3, 5))
                     return True
             except Exception as e:
                 log(f"[广告-入口异常] {e}")
@@ -546,6 +571,12 @@ def main():
             if act == "CLOSE":
                 log(f"[广告-已看完] {action.get('reason','')}")
                 ad_state = AD_CLOSE
+            elif act == "BACK":
+                # 详情页竟是登录/注册页(浏览没意义): 直接BACK返回, 不再双路径
+                log(f"[广告-详情页登录页] {action.get('reason','')} —— 直接BACK返回")
+                adb_back()
+                time.sleep(2)
+                ad_state = AD_BACK
             else:
                 # 双路径退出: ①H5页面(如保险登录页)可BACK返回 ②咨询弹窗可点弹窗右上角X
                 log("[广告-详情页看完] 先BACK返回(处理H5页), 再点弹窗右上角X(处理弹窗)")
@@ -588,15 +619,16 @@ def main():
                             log(f"[广告-关闭按钮AI定位] 坐标({x},{y}) reason={close_action.get('reason','')}")
                             adb_tap(x, y)
                         else:
-                            log(f"[广告-关闭AI未给出按钮] 回退固定右上角X")
-                            tap_close(ow, oh)
+                            # AI没找到关闭按钮: 大概率是H5页/登录页(无原生X), 直接BACK比固定X更快更稳
+                            log(f"[广告-关闭AI未给出按钮] 直接BACK退出(H5页无原生X)")
+                            adb_back()
                     except Exception as e:
-                        log(f"[广告-关闭AI失败] 回退固定右上角X ({str(e)[:30]})")
-                        tap_close(ow, oh)
+                        log(f"[广告-关闭AI失败] 直接BACK退出 ({str(e)[:30]})")
+                        adb_back()
                     ad_close_streak += 1
                     time.sleep(random.uniform(3, 5))
                 elif ad_close_streak == 1:
-                    log("[广告-仍在广告页] AI定位后再试固定右上角X")
+                    log("[广告-仍在广告页] BACK后再试固定右上角X")
                     tap_close(ow, oh)
                     ad_close_streak += 1
                     time.sleep(random.uniform(3, 5))
@@ -639,6 +671,7 @@ def main():
         if ad_state != AD_IDLE:
             log("[状态机] 已离开广告Activity, 复位")
             ad_state = AD_IDLE
+            _ad_wait_streak = 0   # 重置广告WAIT计数(页面已变)
             _last_uia_pos = None; _uia_streak = 0   # 重置防卡死(页面已变)
 
         # 兜底1: 连续多次WAIT说明可能卡在某个页面, 强制返回一次
