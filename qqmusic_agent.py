@@ -552,10 +552,10 @@ def main():
             time.sleep(2)
             return True
         if ad_state == AD_BACK:
-            # 已点弹窗X/BACK, 应回到广告页(显示"恭喜已获得奖励") → 点右上角X关闭
+            # 已点弹窗X/BACK, 应回到广告页(显示"恭喜已获得奖励") → 交给AD_CLOSE由AI定位关闭按钮
+            # (不同广告关闭按钮位置不同, 固定坐标(999,256)常点空, 纯AI判断更稳)
             if is_ad_activity():
-                log("[广告-回广告页] 点右上角X关闭")
-                tap_close(ow, oh)
+                log("[广告-回广告页] 交给AI定位关闭按钮")
                 ad_state = AD_CLOSE
             else:
                 log("[广告-BACK] 已离开广告Activity, 回金币页")
