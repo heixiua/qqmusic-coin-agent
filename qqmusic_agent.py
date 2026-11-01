@@ -467,7 +467,7 @@ def main():
     _last_uia_time = 0.0      # 上一次硬编码点击的时间戳
     _uia_streak = 0           # 同一按钮连续命中计数(>=2 即第3次 -> 下滑换任务)
 
-    global _ad_wait_streak    # 广告状态机内连续WAIT计数(登录页/无入口页兜底BACK)
+    # 广告状态机内连续WAIT计数(登录页/无入口页兜底BACK) — 仅main/ad_step作用域内使用, 用nonlocal传递
     _ad_wait_streak = 0
 
     # 支持命令行传轮数: python qqmusic_agent.py 5 (试跑5轮)
@@ -503,7 +503,7 @@ def main():
 
     def ad_step(ow, oh):
         """广告状态机单步执行, 返回状态(是否仍需继续广告流程)"""
-        nonlocal ad_state, ad_watch_start, ad_close_streak
+        nonlocal ad_state, ad_watch_start, ad_close_streak, _ad_wait_streak
         if ad_state == AD_IDLE:
             return False
         if ad_state == AD_ENTRY:
