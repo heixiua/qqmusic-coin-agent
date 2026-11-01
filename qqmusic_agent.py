@@ -54,7 +54,7 @@ SCREEN_PATH = "screen_tmp.png"
 # ===== 版本2: 金币页硬编码优先(减少AI调用) =====
 # uiautomator dump 命中这些任务文本就直接代码点击, 不调AI; dump拿不到才走AI视觉
 UA_TASK_KEYWORDS = [
-    "看视频领金币", "看视频得", "看广告领金币",      # 看视频类
+    "看视频",                                     # 看视频类(含弹窗"看视频+100金币"/背景"看视频得高额金币")
     "浏览5秒", "浏览广告",                          # 浏览类(看完广告后的福利/任务)
     "观看下一条", "观看完成",                        # 连看弹窗
     "定时领金币", "每日免费抽奖", "领额外奖励",      # 定时/抽奖
@@ -81,13 +81,16 @@ SYSTEM_PROMPT = (
     "【金币任务页判断】\n"
     "- 页面顶部/中部的【活动任务】区域: 打开xx应用/去xx刷/下载xx/打开xx小程序 等跳转第三方App任务一律跳过不点击。\n"
     "- 可点击任务只有这几类: ①【看视频领金币/看视频得高额金币/看视频得金币】②【金币中心看视频翻卡】(领金币/去翻卡) "
-    "③【定时领金币】④【每日免费抽奖/领额外奖励】⑤【浏览5秒再领金币/浏览广告/看广告领金币】(点击后进入QQ音乐内嵌广告容器, 由状态机自动处理)"
+    "③【定时领金币】④【每日免费抽奖/领额外奖励/幸运大转盘】⑤【浏览5秒再领金币/浏览广告/看广告领金币】(点击后进入QQ音乐内嵌广告容器, 由状态机自动处理)"
     "⑥【观看下一条/观看完成+金币】弹窗按钮(看完广告后弹出的连看入口, 弹多次是正常的, 每次点它都能再看一条广告再拿金币)。\n"
     "- 其他所有任务(听歌/听有声书/分享/收藏/关注/红包雨/摇钱树/小组件/下载/打开/去) 全部跳过。\n"
+    "- 【幸运大转盘】浮层页: 显示今日剩余抽奖次数+九宫格转盘, 点中心的【每日首次免费抽奖】按钮(可免费抽1次, 抽完领取金币); "
+    "若已抽过/显示次数为0或该按钮已不可点, 输出BACK返回金币页。\n"
     "\n"
     "输出规则:\n"
     "- 金币页看到可点击任务按钮(上述6类): {\"action\":\"CLICK\",\"x\":<0~1000>,\"y\":<0~1000>,\"reason\":\"点击什么\"}\n"
     "- 屏幕任务全部不可点/已领过: {\"action\":\"SWIPE\",\"reason\":\"下滑看更多\"}\n"
+    "- 幸运大转盘浮层已抽完/无免费次数: {\"action\":\"BACK\",\"reason\":\"转盘抽完,返回金币页\"}\n"
     "- 拿不准: {\"action\":\"SWIPE\",\"reason\":\"不确定,下滑看看\"}\n"
     "严禁点击: 活动任务区、听歌/分享/收藏/关注/红包雨/下载类任务、任何带【去xx/打开xx/下载xx】字样的跳第三方任务、广告页里的任何按钮(广告页状态机自动处理)。"
 )
@@ -99,9 +102,23 @@ AD_ENTRY_PROMPT = (
     "1. 页面有【了解详情/点击查看/立即咨询/进入详情页或第三方应用】按钮时: {\"action\":\"CLICK\",\"x\":X,\"y\":X,\"reason\":\"点跳转按钮启动计时\"}, "
     "x,y为该按钮中心相对坐标(0~1000)。注意: 页面可能同时有多个入口(如顶部横幅+底部按钮), 点最明显的那个。"
     "【立即咨询】也是合法的跳转按钮(进入保险H5/咨询详情页, 计时照常走, 看完BACK能退出), 不要因为含'咨询'就拒绝点它。\n"
+    "1b. 页面弹出【点击后浏览15秒/点击立即浏览/立即浏览/开始浏览/浏览15秒可获得奖励】这类确认弹窗时: {\"action\":\"CLICK\",\"x\":X,\"y\":Y,\"reason\":\"点立即浏览开始计时\"}, "
+    "点弹窗里最显眼的红色/主按钮【点击立即浏览】(不是灰色【放弃奖励】, 点了放弃就没有奖励)。\n"
     "2. 页面有【恭喜已获得奖励/已获得奖励/已完成】提示(说明广告已看完): {\"action\":\"CLOSE\",\"reason\":\"广告已看完,点X关闭\"}。\n"
     "3. 两种都不确定: {\"action\":\"WAIT\",\"reason\":\"看不清,再等等\"}。\n"
     "严禁点击: 下载/立即打开/登录/购买/领券/打开微信客服(这些会跳第三方, 不领金币), 严禁输出BACK。只输出JSON。"
+)
+
+AD_CLOSE_PROMPT = (
+    "你是广告关闭按钮定位Agent。分析截图, 只输出一个JSON对象。\n"
+    "任务: 找到广告页/广告弹窗的【关闭/退出按钮】并输出其中心相对坐标(0~1000)。\n"
+    "关闭按钮常见形态:\n"
+    "- 页面右上角的小X图标(最常见);\n"
+    "- 页面左上角的【恭喜获得奖励|退出】提示栏中的【退出】部分(注意是整条提示栏里的退出文字, 不是广告内容);\n"
+    "- 弹窗右上角的X图标(弹窗自带的关闭)。\n"
+    "输出: {\"action\":\"CLICK\",\"x\":<0~1000>,\"y\":<0~1000>,\"reason\":\"点关闭按钮\"}\n"
+    "注意: 严禁点击【立即咨询/了解详情/进入详情页/领取/查看价格】等广告跳转按钮(那是AD_ENTRY的活, 点了会重新进广告), 只点关闭/退出按钮。"
+    "若截图看不到任何关闭/退出按钮: {\"action\":\"WAIT\",\"reason\":\"看不到关闭按钮\"}。只输出JSON。"
 )
 
 def log(msg):
@@ -167,7 +184,8 @@ def call_vlm(img_b64, mode="normal"):
     """按降级链调用多模态视觉模型, 返回动作dict; 全部失败返回WAIT
     mode: "normal"=金币页常规判断, "ad"=广告页按钮定位"""
     last_err = None
-    sys_prompt = AD_ENTRY_PROMPT if mode == "ad" else SYSTEM_PROMPT
+    sys_prompt = (AD_ENTRY_PROMPT if mode == "ad" else
+                  AD_CLOSE_PROMPT if mode == "close" else SYSTEM_PROMPT)
     for p in VLM_PROVIDERS:
         api_key = os.getenv(p["api_key_env"])
         if not api_key:
@@ -282,6 +300,12 @@ def uia_detect_click():
         return None
     if not xml or "<node" not in xml:
         return None
+    # ===== 浮层检测: 转盘/抽奖类浮层盖住金币页时, dump拿不到浮层自己的按钮(WebView), 反而命中下层无效节点
+    # 命中这些特征说明当前是浮层页面, 直接交给AI视觉(截图能看到浮层真实按钮)
+    for _ft in ("幸运大转盘", "今日剩余抽奖次数", "每日首次", "免费抽奖", "转盘"):
+        if _ft in xml:
+            log(f"[硬编码] 检测到浮层特征[{_ft}], 转AI视觉判断")
+            return None
     click_hits = []   # (面积, cx, cy, txt, kw)
     any_hits = []
     for m in re.finditer(r'<node[^>]*>', xml):
@@ -333,7 +357,7 @@ def _match_task_keyword(txt):
 
 def run_once():
     """单轮: 硬编码优先 -> 截屏识图兜底"""
-    global _last_had_click
+    global _last_had_click, _last_uia_pos, _last_uia_time, _uia_streak
     if random.random() < SKIP_PROB:
         w = random.uniform(4, 10)
         log(f"[跳过本轮] 随机暂停 {w:.1f}s")
@@ -345,6 +369,25 @@ def run_once():
     uia_hit = uia_detect_click()
     if uia_hit:
         cx, cy = uia_hit
+        # ===== 防卡死: 同一按钮连续命中3次(45秒内, 间距<30px) -> 判定无效, 改下滑 =====
+        now = time.time()
+        if (_last_uia_pos is not None and
+                abs(cx - _last_uia_pos[0]) < 30 and abs(cy - _last_uia_pos[1]) < 30 and
+                now - _last_uia_time < 45):
+            _uia_streak += 1
+        else:
+            _uia_streak = 0
+        _last_uia_pos = (cx, cy)
+        _last_uia_time = now
+        if _uia_streak >= 2:   # 第3次命中同一按钮
+            log(f"[防卡死] 连续3次命中同一按钮({cx},{cy}), 判定无效, 改下滑换任务")
+            _uia_streak = 0
+            _last_uia_pos = None
+            adb_swipe_up()
+            w = random.uniform(WAIT_MIN, WAIT_MAX)
+            log(f"[等待] {w:.1f}s")
+            time.sleep(w)
+            return "SWIPE"
         cx += random.randint(-OFFSET, OFFSET)
         cy += random.randint(-OFFSET, OFFSET)
         log(f"[点击:硬编码] 坐标({cx},{cy})")
@@ -411,8 +454,11 @@ def main():
     if not Path(ADB).exists():
         log(f"!! adb 路径不存在: {ADB}")
         sys.exit(1)
-    global _last_had_click
+    global _last_had_click, _last_uia_pos, _last_uia_time, _uia_streak
     _last_had_click = False
+    _last_uia_pos = None      # 上一次硬编码点击的坐标(防卡死用)
+    _last_uia_time = 0.0      # 上一次硬编码点击的时间戳
+    _uia_streak = 0           # 同一按钮连续命中计数(>=2 即第3次 -> 下滑换任务)
 
     # 支持命令行传轮数: python qqmusic_agent.py 5 (试跑5轮)
     rounds = MAX_ROUNDS
@@ -517,22 +563,48 @@ def main():
             time.sleep(random.uniform(3, 5))
             return True
         if ad_state == AD_CLOSE:
-            # 点过右上角X, 确认是否已退出广告
+            # 点过关闭按钮, 确认是否已退出广告
             if not is_ad_activity():
                 log("[广告-关闭完成] 已回金币页")
                 ad_state = AD_IDLE
             else:
-                # 仍判定在广告Activity但右上角X无效 → 可能是H5页/弹窗残留, 换BACK退出, 避免死循环点X
-                if ad_close_streak >= 2:
-                    log("[广告-仍在广告页且X无效] 连续点X无效, 改BACK退出")
-                    adb_back()
-                    ad_close_streak = 0
+                # 仍判定在广告Activity: 先用AI视觉定位关闭按钮(不同广告X/退出按钮位置不同, 固定坐标常点空)
+                if ad_close_streak == 0:
+                    try:
+                        (ow_c, oh_c), b64_c = capture_and_encode()
+                        close_action = call_vlm(b64_c, mode="close")
+                        if close_action.get("action") == "CLICK":
+                            try:
+                                rx = float(close_action.get("x", 500))
+                                ry = float(close_action.get("y", 500))
+                            except (TypeError, ValueError):
+                                rx, ry = 500, 500
+                            x = int(rx / 1000 * ow_c) + random.randint(-OFFSET, OFFSET)
+                            y = int(ry / 1000 * oh_c) + random.randint(-OFFSET, OFFSET)
+                            log(f"[广告-关闭按钮AI定位] 坐标({x},{y}) reason={close_action.get('reason','')}")
+                            adb_tap(x, y)
+                        else:
+                            log(f"[广告-关闭AI未给出按钮] 回退固定右上角X")
+                            tap_close(ow, oh)
+                    except Exception as e:
+                        log(f"[广告-关闭AI失败] 回退固定右上角X ({str(e)[:30]})")
+                        tap_close(ow, oh)
+                    ad_close_streak += 1
                     time.sleep(random.uniform(3, 5))
-                else:
-                    log("[广告-仍在广告页] 再点一次右上角X")
+                elif ad_close_streak == 1:
+                    log("[广告-仍在广告页] AI定位后再试固定右上角X")
                     tap_close(ow, oh)
                     ad_close_streak += 1
                     time.sleep(random.uniform(3, 5))
+                else:
+                    # 仍判定在广告Activity且右上角X无效 → 可能是H5页/弹窗残留/未点立即浏览的确认弹窗
+                    log("[广告-仍在广告页且关闭无效] 连续关闭失败, 改BACK退出")
+                    adb_back()
+                    ad_close_streak = 0
+                    time.sleep(random.uniform(3, 5))
+                    # BACK后可能回到广告页(确认弹窗/广告本体): 交给AD_ENTRY让模型重新判断
+                    # (可能是"点击立即浏览"没点、或"恭喜已获得奖励"该点X, 不能继续死点X)
+                    ad_state = AD_ENTRY
             return True
         return False
 
@@ -547,6 +619,7 @@ def main():
                 adb_back()
                 time.sleep(1.5)
             ad_state = AD_IDLE
+            _last_uia_pos = None; _uia_streak = 0   # 重置防卡死(页面已变)
             time.sleep(random.uniform(3, 6))
             continue
 
@@ -562,6 +635,7 @@ def main():
         if ad_state != AD_IDLE:
             log("[状态机] 已离开广告Activity, 复位")
             ad_state = AD_IDLE
+            _last_uia_pos = None; _uia_streak = 0   # 重置防卡死(页面已变)
 
         # 兜底1: 连续多次WAIT说明可能卡在某个页面, 强制返回一次
         if wait_streak >= 3:
