@@ -1,0 +1,16 @@
+# ===== 密钥与配置（绝对不提交，只提交 .env.example 模板）=====
+.env
+
+# ===== 本地 adb 工具（体积大，对方自行下载）=====
+platform-tools/
+
+# ===== 运行产生的临时文件 =====
+screen_tmp.png
+*.log
+
+# ===== Python =====
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
