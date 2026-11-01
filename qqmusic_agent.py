@@ -101,6 +101,9 @@ SYSTEM_PROMPT = (
     "- 金币页看到可点击任务按钮(上述6类): {\"action\":\"CLICK\",\"x\":<0~1000>,\"y\":<0~1000>,\"reason\":\"点击什么\"}\n"
     "- 屏幕任务全部不可点/已领过/只剩用户自己刷的任务: {\"action\":\"SWIPE\",\"reason\":\"下滑看更多\"}\n"
     "- 拿不准: {\"action\":\"SWIPE\",\"reason\":\"不确定,下滑看看\"}\n"
+    "- 【未知页面识别(重要)】截图既不是金币任务页、也不是广告奖励页(没有任务按钮列表), 而是以下形态时: "
+    "歌曲播放页/视频播放页(有播放进度条、暂停/播放按钮、歌曲名或视频画面)、空白引导页、加载页、异常页 → "
+    "{\"action\":\"BACK\",\"reason\":\"非金币页,返回\"}(播放页/视频页听满15秒金币自动到账, 直接返回即可)。\n"
     "严禁点击: 活动任务区、定时领金币/翻卡/听歌/分享/收藏/关注/红包雨/下载/领额外奖励类任务、任何带【去xx/打开xx/下载xx/免费领】字样的任务、广告页里的任何按钮(广告页状态机自动处理)。"
 )
 
@@ -134,7 +137,61 @@ AD_CLOSE_PROMPT = (
 )
 
 def log(msg):
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+    print(line, flush=True)
+    # 同时落盘 agent_run.log (供 evolver 采样分析, gitignore)
+    try:
+        with open("agent_run.log", "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+# ===== watchdog: 画面相似度卡住检测 =====
+WD_SIM_ROUNDS = 10      # 连续N轮画面相似度>=90% -> 判卡住(用户指定)
+SAMPLE_DIR = Path("ad_samples")   # 卡住样本存放目录
+
+def calc_screen_sig(path, size=(16, 16)):
+    """计算截图特征: 缩略图灰度像素列表(用于相似度比较)"""
+    try:
+        img = Image.open(path).convert("L").resize(size, Image.LANCZOS)
+        return list(img.getdata())
+    except Exception:
+        return None
+
+def sig_similar(a, b, thresh=0.90):
+    """两个特征是否相似度>=thresh (像素差>8 视为不同, 相同比例>=thresh)"""
+    if not a or not b or len(a) != len(b):
+        return False
+    diffs = sum(1 for x, y in zip(a, b) if abs(x - y) > 8)
+    return 1 - diffs / len(a) >= thresh
+
+def save_sample(round_no, reason):
+    """卡住时被动采样: 3张间隔截图 + 上下文(日志尾部/焦点/状态) 到 ad_samples/<ts>_r<n>/"""
+    try:
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        d = SAMPLE_DIR / f"{ts}_r{round_no}"
+        d.mkdir(parents=True, exist_ok=True)
+        for i in range(3):
+            screencap(SCREEN_PATH)
+            with open(d / f"shot_{i}.png", "wb") as f:
+                f.write(Path(SCREEN_PATH).read_bytes())
+            if i < 2:
+                time.sleep(2)
+        # 上下文: 焦点 + 最近日志尾部
+        focus = current_focus_window()
+        ctx = [f"round={round_no}  time={time.strftime('%H:%M:%S')}  reason={reason}",
+               f"focus={focus}", ""]
+        try:
+            with open("agent_run.log", "r", encoding="utf-8") as f:
+                tail = f.readlines()[-40:]
+            ctx.append("===== 最近日志 =====")
+            ctx.extend(l.rstrip("\n") for l in tail)
+        except Exception:
+            pass
+        (d / "context.txt").write_text("\n".join(ctx), encoding="utf-8")
+        log(f"[watchdog] 已采样卡住样本: {d}")
+    except Exception as e:
+        log(f"[watchdog] 采样失败: {str(e)[:60]}")
 
 def screencap(path):
     """adb截屏保存到文件"""
@@ -491,6 +548,10 @@ def main():
     wait_streak = 0   # 连续WAIT计数, 连续3次强制BACK兜底
     swipe_streak = 0  # 连续SWIPE计数, 连续8次强制BACK回顶部
 
+    # ===== watchdog 状态 =====
+    _last_sig = None      # 上一轮画面指纹
+    _wd_streak = 0        # 连续相似轮数(>=WD_SIM_ROUNDS 判卡住)
+
     # ===== 广告流程状态机 (代码强制流转, 不靠模型猜状态) =====
     # AD_IDLE=0 正常金币页 | AD_ENTRY=1 刚进广告页→点跳转按钮(了解详情/立即咨询)
     # AD_WATCH=2 新页面(TransPortraitADActivity)等15秒 | AD_BACK=3 点弹窗右上角X回广告页
@@ -647,6 +708,35 @@ def main():
     while n < rounds:
         n += 1
         log(f"===== 第 {n}/{rounds} 轮 =====")
+
+        # ===== watchdog: 画面相似度卡住检测(用户指定: 同广告刷10轮相似度>=90%判卡住) =====
+        # 每轮先截屏做画面指纹, 连续WD_SIM_ROUNDS轮相似 -> 画面没动 -> 判定卡住(不再信日志)
+        try:
+            _wd_sig = calc_screen_sig(SCREEN_PATH)
+            if _wd_sig is not None:
+                if _last_sig is not None and sig_similar(_last_sig, _wd_sig):
+                    _wd_streak += 1
+                else:
+                    _wd_streak = 0
+                _last_sig = _wd_sig
+                if _wd_streak >= WD_SIM_ROUNDS:
+                    log(f"[watchdog] 连续{WD_SIM_ROUNDS}轮画面相似度>=90%, 判定卡住(画面未动)")
+                    save_sample(n, "画面连续相似>=90%")
+                    # 自救: BACK + 强制下滑, 打破静止画面
+                    for _ in range(2):
+                        adb_back()
+                        time.sleep(1.5)
+                    adb_swipe_up()
+                    _wd_streak = 0
+                    _last_sig = None
+                    _last_uia_pos = None; _uia_streak = 0
+                    wait_streak = 0; swipe_streak = 0
+                    ad_state = AD_IDLE
+                    _ad_wait_streak = 0
+                    time.sleep(random.uniform(3, 6))
+                    continue
+        except Exception as e:
+            log(f"[watchdog] 检测异常: {str(e)[:50]}")
 
         # 兜底0(最高优先): 误点了跳转第三方App的任务(京东/淘宝等), 焦点已离开QQ音乐 → 强制返回
         if not is_in_qqmusic() and not is_ad_activity():

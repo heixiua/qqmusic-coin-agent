@@ -8,6 +8,10 @@ platform-tools/
 screen_tmp.png
 *.log
 
+# ===== 自我进化: 卡住样本 + 生成的补丁(不提交, 样本含截图/日志) =====
+ad_samples/
+patches/
+
 # ===== Python =====
 __pycache__/
 *.pyc
