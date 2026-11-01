@@ -344,6 +344,9 @@ def adb_swipe_up():
 PLAY_WAIT_SECONDS = 15
 _play_wait_start = 0.0
 
+# 连续BACK计数: 离开金币页后反复BACK只会退到首页/桌面, 第2次起暂停等用户手动回金币页
+_back_streak = 0
+
 def play_wait_then_back(reason=""):
     """播放页: 首轮开始计时, 等满PLAY_WAIT_SECONDS再BACK一次; 未满先等待. 返回PLAY_WAIT或BACK"""
     global _play_wait_start
@@ -464,7 +467,7 @@ def _match_task_keyword(txt):
 
 def run_once():
     """单轮: 硬编码优先 -> 截屏识图兜底"""
-    global _last_had_click, _last_uia_pos, _last_uia_time, _uia_streak, _play_wait_start
+    global _last_had_click, _last_uia_pos, _last_uia_time, _uia_streak, _play_wait_start, _back_streak
     if random.random() < SKIP_PROB:
         w = random.uniform(4, 10)
         log(f"[跳过本轮] 随机暂停 {w:.1f}s")
@@ -477,6 +480,7 @@ def run_once():
     if uia_hit:
         cx, cy = uia_hit
         _play_wait_start = 0.0   # 已回到金币页, 播放计时复位
+        _back_streak = 0         # 金币页任务可点, BACK计数复位
         # ===== 防卡死: 同一按钮连续命中3次(45秒内, 间距<30px) -> 判定无效, 改下滑 =====
         now = time.time()
         if (_last_uia_pos is not None and
@@ -548,14 +552,22 @@ def run_once():
         log(f"[播放页:{provider}] reason={reason}")
         act = play_wait_then_back(reason)
     elif act == "BACK":
-        log(f"[返回:{provider}] reason={reason}")
-        adb_back()
+        _back_streak += 1
+        if _back_streak >= 2:
+            # 连续BACK无效: 说明已经离开金币页(我的/首页), 再BACK只会退出App; 暂停等用户手动回金币页
+            log(f"[离开金币页] 连续{_back_streak}次BACK无效, 暂停30秒 —— 请手动回到金币狂欢节页面")
+            time.sleep(30)
+        else:
+            log(f"[返回:{provider}] reason={reason}")
+            adb_back()
         # BACK后如果还在广告页: 广告流程尚未走完, 交给主循环ad_streak判断是否重启, 不在此打断
     else:
         log(f"[等待:{provider}] reason={reason}")
 
     if act != "PLAY_WAIT":
         _play_wait_start = 0.0   # 页面已不是播放页, 计时复位
+    if act in ("CLICK", "SWIPE", "PLAY_WAIT", "WAIT"):
+        _back_streak = 0         # 页面已有正常动作, BACK计数复位
 
     w = random.uniform(WAIT_MIN, WAIT_MAX)
     log(f"[等待] {w:.1f}s")
@@ -569,9 +581,10 @@ def main():
     if not Path(ADB).exists():
         log(f"!! adb 路径不存在: {ADB}")
         sys.exit(1)
-    global _last_had_click, _last_uia_pos, _last_uia_time, _uia_streak, _play_wait_start
+    global _last_had_click, _last_uia_pos, _last_uia_time, _uia_streak, _play_wait_start, _back_streak
     _last_had_click = False
     _play_wait_start = 0.0
+    _back_streak = 0
     _last_uia_pos = None      # 上一次硬编码点击的坐标(防卡死用)
     _last_uia_time = 0.0      # 上一次硬编码点击的时间戳
     _uia_streak = 0           # 同一按钮连续命中计数(>=2 即第3次 -> 下滑换任务)
