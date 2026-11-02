@@ -322,11 +322,15 @@ def capture_and_encode():
 
 
 def adb_tap(x, y):
+    global _LAST_DUMP_XML
     subprocess.run([ADB, "shell", "input", "tap", str(int(x)), str(int(y))], check=True, timeout=8)
+    _LAST_DUMP_XML = ""        # 页面可能变了: 作废旧dump, 否则会拿上一页的文字误判当前页
 
 
 def adb_back():
+    global _LAST_DUMP_XML
     subprocess.run([ADB, "shell", "input", "keyevent", "4"], check=True, timeout=8)
+    _LAST_DUMP_XML = ""        # 同上: 页面已变, 旧dump不可再用于判断
 
 
 def adb_swipe_up():
@@ -589,6 +593,7 @@ def tap_text_priority(specs):
 # 只有点"放弃奖励"才能真退出; 弹窗文案本身含"退出"二字, 故"退出"要排除"退出就/没有奖励"避免误点弹窗正文。
 AD_CLOSE_TEXT_SPECS = [
     ("放弃奖励", (), False, False),
+    ("跳过", (), False, True),          # QQ音乐开屏广告右上角"跳过"(点CTA回前台时常见)
     ("放弃", ("放弃领取", "放弃红包"), False, False),
     ("退出", ("退出登录", "退出账号", "退出登录账号", "退出就", "没有奖励"), False, True),
     ("返回", ("返回首页", "返回顶部", "返回上一级"), False, False),
