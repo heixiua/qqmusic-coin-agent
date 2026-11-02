@@ -95,6 +95,11 @@ SYSTEM_PROMPT = (
     "- 优先级: 页面同时有【立即抽奖】和【看视频】时, 【优先点立即抽奖】(抽奖次数有限先刷完, 抽完自动回金币页再刷看视频)。\n"
     "- 【看视频板块必须刷完】只要当前屏幕还能看到【看视频领金币】或【看视频得高额金币】板块里的【看视频/领金币/去完成】按钮, 必须先点它, "
     "严禁SWIPE下滑; 只有当前屏幕内这些按钮都不可见或都已领完, 才允许下滑。\n"
+    "- 【同类任务可重复(重要)】看视频领金币/看视频得高额金币/观看视频再抽1次等任务每天有多次机会, 只要按钮还在、"
+    "且不是【已完成/已领完/次数0/灰色不可点】, 就继续点; 严禁因为'动作历史里出现过CLICK'或'刚才点过一次'就判定这个任务已完成。"
+    "动作历史只用于判断连续SWIPE/BACK是否卡住, 不代表任何任务已完成。\n"
+    "- 【广告关闭回到金币页后】优先点击当前屏幕内仍可见的看视频/立即抽奖/浏览5秒按钮, 不要先下滑找别的任务; "
+    "只有当前屏幕确实没有可点按钮时才允许下滑。\n"
     "- 其他所有任务(定时领金币/翻卡/听歌/听有声书/分享/收藏/关注/红包雨/摇钱树/小组件/下载/打开/去/免费领礼物/领额外奖励等) 全部跳过不点击, 用户自己刷。\n"
     "- 特别注意: 【领金币】按钮只有【看视频领金币】板块内的才点(它和板块标题'看视频领金币'在一起); "
     "定时领金币/红包雨来啦/听歌满5分钟等任务行右侧的【领金币】按钮一律不点。\n"
@@ -186,10 +191,14 @@ def remember_action(action, reason=""):
     if len(_recent_actions) > 10:
         del _recent_actions[:-10]
 
-def action_history_text(n=6):
+def action_history_text(n=6, with_reason=True):
+    """动作历史文本. 给模型看时只给动作序列(不给任务名), 避免模型误判"点过=已完成" """
     if not _recent_actions:
         return "（无）"
-    return " -> ".join(f"{a}({r})" if r else a for a, r in _recent_actions[-n:])
+    items = _recent_actions[-n:]
+    if with_reason:
+        return " -> ".join(f"{a}({r})" if r else a for a, r in items)
+    return " -> ".join(a for a, _ in items)
 
 # ===== 卡住样本采样(保留给 evolver 使用, 不再是AI自救触发) =====
 SAMPLE_DIR = Path("ad_samples")   # 卡住样本存放目录
@@ -288,7 +297,8 @@ def call_vlm(img_b64, mode="normal"):
     # 金币页常规判断时附上最近动作历史(纯文本短期记忆), 让模型能看到自己在重复什么
     user_text = "分析这张手机截图，按规则输出JSON。"
     if mode == "normal":
-        user_text = f"最近动作历史(旧→新): {action_history_text()}\n" + user_text
+        # 只给动作序列(SWIPE/CLICK/TOP...), 不给任务名: 防止模型看到"点过看视频"就判定任务已完成
+        user_text = f"最近动作历史(旧→新): {action_history_text(with_reason=False)}\n" + user_text
     for p in VLM_PROVIDERS:
         api_key = os.getenv(p["api_key_env"])
         if not api_key:
