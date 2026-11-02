@@ -108,6 +108,8 @@ SYSTEM_PROMPT = (
     "- 【天天抽奖/免费得好礼】整页抽奖机页(页面显示'看广告抽奖'和'剩余看广告次数 X/10'): "
     "X>0 → {\"action\":\"CLICK\",\"x\":<0~1000>,\"y\":<0~1000>,\"reason\":\"点看广告抽奖\"}; "
     "X=0/次数已用完且页面不能下滑 → {\"action\":\"BACK\",\"reason\":\"天天抽奖次数已用完,返回金币页\"}, 严禁SWIPE。\n"
+    "- 【看广告领好礼/金币抽奖页】页面显示【今日奖品已派发完毕/明日再来】时: "
+    "{\"action\":\"BACK\",\"reason\":\"今日奖品已派发完毕,返回金币页\"}, 严禁点击页面按钮或SWIPE。\n"
     "- 【用动作历史判断卡住(重要)】输入会附带'最近动作历史(旧→新)', 这是你前几轮真实执行的动作: "
     "①连续3次以上SWIPE且中间没有任何CLICK = 你在原地重复下滑(页面不可滚动或已到底), 禁止再SWIPE; "
     "整页活动页(天天抽奖/免费得好礼/抽奖机/详情页) → BACK; 金币任务列表页 → TOP(回页面顶部重新扫描); "
@@ -299,6 +301,9 @@ def call_vlm(img_b64, mode="normal"):
     if mode == "normal":
         # 只给动作序列(SWIPE/CLICK/TOP...), 不给任务名: 防止模型看到"点过看视频"就判定任务已完成
         user_text = f"最近动作历史(旧→新): {action_history_text(with_reason=False)}\n" + user_text
+        if tian_draw_exhausted():
+            user_text = ("当前状态: 天天抽奖/抽奖赢金币的看广告次数已用完(0/10), "
+                         "本轮严禁再点【立即抽奖】; 优先点看视频领金币/看视频得高额金币, 没有就SWIPE/TOP。\n") + user_text
     for p in VLM_PROVIDERS:
         api_key = os.getenv(p["api_key_env"])
         if not api_key:
@@ -375,6 +380,12 @@ _back_streak = 0
 
 # 广告刚关闭标记: 关广告后露出的播放页是残留页面, 不需要再等15秒
 _post_ad_round = False
+
+# 天天抽奖次数已用完标记(到期时间戳): 避免"金币页点立即抽奖 -> 0/10 -> BACK -> 又点立即抽奖"死循环
+_tian_draw_exhausted_until = 0.0
+
+def tian_draw_exhausted():
+    return time.time() < _tian_draw_exhausted_until
 
 def play_wait_then_back(reason=""):
     """播放页: 首轮开始计时, 等满PLAY_WAIT_SECONDS再BACK一次; 未满先等待. 返回PLAY_WAIT或BACK"""
@@ -496,7 +507,7 @@ def _match_task_keyword(txt):
 
 def run_once():
     """单轮: 硬编码优先 -> 截屏识图兜底"""
-    global _last_had_click, _last_uia_pos, _last_uia_time, _uia_streak, _play_wait_start, _back_streak, _post_ad_round
+    global _last_had_click, _last_uia_pos, _last_uia_time, _uia_streak, _play_wait_start, _back_streak, _post_ad_round, _tian_draw_exhausted_until
     post_ad = _post_ad_round   # 本轮的"刚关广告"状态只消费一次
     _post_ad_round = False
     if random.random() < SKIP_PROB:
@@ -559,24 +570,30 @@ def run_once():
     reason = action.get("reason", "")
 
     if act == "CLICK":
-        # 相对坐标(0~1000)映射回原图坐标; 模型可能返回字符串, 先转float
-        try:
-            rx = float(action.get("x", 500))
-            ry = float(action.get("y", 500))
-        except (TypeError, ValueError):
-            rx, ry = 500, 500
-        x = int(rx / 1000 * ow)
-        y = int(ry / 1000 * oh)
-        # 随机偏移反风控
-        x += random.randint(-OFFSET, OFFSET)
-        y += random.randint(-OFFSET, OFFSET)
-        log(f"[点击:{provider}] 坐标({x},{y}) reason={reason}")
-        try:
-            adb_tap(x, y)
-        except Exception as e:
-            log(f"[点击失败] {e}")
-        # 点击即视为广告流程有进展, 重置卡死计数
-        _last_had_click = True
+        if tian_draw_exhausted() and ("立即抽奖" in reason or "抽奖赢金币" in reason):
+            # 天天抽奖0/10后模型仍想点"立即抽奖": 代码强制拦截, 否则会在金币页↔抽奖页来回死循环
+            log(f"[防循环] 天天抽奖次数已用完, 跳过立即抽奖 -> 上滑找看视频 reason={reason}")
+            adb_swipe_up()
+            act = "SWIPE"
+        else:
+            # 相对坐标(0~1000)映射回原图坐标; 模型可能返回字符串, 先转float
+            try:
+                rx = float(action.get("x", 500))
+                ry = float(action.get("y", 500))
+            except (TypeError, ValueError):
+                rx, ry = 500, 500
+            x = int(rx / 1000 * ow)
+            y = int(ry / 1000 * oh)
+            # 随机偏移反风控
+            x += random.randint(-OFFSET, OFFSET)
+            y += random.randint(-OFFSET, OFFSET)
+            log(f"[点击:{provider}] 坐标({x},{y}) reason={reason}")
+            try:
+                adb_tap(x, y)
+            except Exception as e:
+                log(f"[点击失败] {e}")
+            # 点击即视为广告流程有进展, 重置卡死计数
+            _last_had_click = True
     elif act == "SWIPE":
         log(f"[下滑:{provider}] reason={reason}")
         adb_swipe_up()
@@ -597,6 +614,11 @@ def run_once():
             log(f"[播放页:{provider}] reason={reason}")
             act = play_wait_then_back(reason)
     elif act == "BACK":
+        # 天天抽奖0/10: 记录"已用完", 回金币页后滚回顶部, 避免又点立即抽奖形成死循环
+        exhausted_now = ("天天抽奖" in reason and ("用完" in reason or "0/" in reason or "0次" in reason))
+        if exhausted_now:
+            _tian_draw_exhausted_until = time.time() + 600
+            log("[抽奖状态] 天天抽奖次数已用完(0/10), 本会话不再点立即抽奖(保留当前页面位置, 继续处理下方任务)")
         # 非广告页被判"非金币页": 先让导航AI判断能否从首页/我的一步步点回金币页, 不再盲目BACK退到桌面死循环
         try:
             nav = call_vlm(b64, mode="nav")
@@ -655,11 +677,12 @@ def main():
     if not Path(ADB).exists():
         log(f"!! adb 路径不存在: {ADB}")
         sys.exit(1)
-    global _last_had_click, _last_uia_pos, _last_uia_time, _uia_streak, _play_wait_start, _back_streak, _post_ad_round
+    global _last_had_click, _last_uia_pos, _last_uia_time, _uia_streak, _play_wait_start, _back_streak, _post_ad_round, _tian_draw_exhausted_until
     _last_had_click = False
     _play_wait_start = 0.0
     _back_streak = 0
     _post_ad_round = False
+    _tian_draw_exhausted_until = 0.0
     _last_uia_pos = None      # 上一次硬编码点击的坐标(防卡死用)
     _last_uia_time = 0.0      # 上一次硬编码点击的时间戳
     _uia_streak = 0           # 同一按钮连续命中计数(>=2 即第3次 -> 下滑换任务)
