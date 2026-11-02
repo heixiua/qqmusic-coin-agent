@@ -44,8 +44,8 @@ AGNES_BASE_URL = "https://apihub.agnes-ai.com/v1"
 AGNES_MODEL = os.getenv("AGNES_MODEL", "agnes-3.0-flash")
 
 MAX_ROUNDS = 200          # 单次运行最多轮数
-SHOT_INTERVAL = 2.0       # 连续截图最小间隔(秒)
-WAIT_MIN, WAIT_MAX = 2.0, 4.0    # 每次动作后随机等待(反风控, 用户调试后从6-15s收紧到2-4s)
+SHOT_INTERVAL = 1.0       # 轮间隔(秒); AI调用本身已耗时10-20s, 无需再等太多
+WAIT_MIN, WAIT_MAX = 1.0, 2.0    # 每次动作后随机等待(反风控, AI调用延迟已提供间隔)
 OFFSET = 12               # 点击坐标随机偏移(千分比坐标下偏移1.2%)
 SKIP_PROB = 0.08          # 随机跳过本轮概率(反风控)
 RESIZE_WIDTH = 800        # 送模型的图片宽度
@@ -777,8 +777,9 @@ def main():
                 ad_state = AD_BACK
             elif act == "WAIT" and elapsed < AD_WATCH_MAX_SECONDS:
                 # 30秒视频/长广告还没播完(AI说看不清/仍在播放): 继续等, 不能16秒就关掉丢金币
+                # AI调用本身已耗时10-20s, 这里只短暂缓冲, 下一轮马上复查
                 log(f"[广告-视频未看完] 已等{elapsed:.0f}s, 继续等待(上限{AD_WATCH_MAX_SECONDS}s)")
-                time.sleep(random.uniform(3, 5))
+                time.sleep(random.uniform(1, 2))
                 return True
             else:
                 # 双路径退出: ①H5页面(如保险登录页)可BACK返回 ②咨询弹窗可点弹窗右上角X
