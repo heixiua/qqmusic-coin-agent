@@ -156,13 +156,15 @@ AD_ENTRY_PROMPT = (
 
 AD_CLOSE_PROMPT = (
     "你是广告关闭按钮定位Agent。分析截图, 只输出一个JSON对象。\n"
-    "任务: 找到广告页/广告弹窗的【关闭/退出按钮】并输出其中心相对坐标(0~1000)。\n"
-    "关闭按钮常见形态:\n"
+    "任务: 找到广告页/广告弹窗的【关闭/退出/返回按钮】并输出其中心相对坐标(0~1000)。\n"
+    "关闭按钮常见形态(任选其一, 优先最明显且肯定能关的那一个):\n"
     "- 页面右上角的小X图标(最常见);\n"
     "- 页面左上角的【恭喜获得奖励|退出】提示栏中的【退出】部分(注意是整条提示栏里的退出文字, 不是广告内容);\n"
+    "- 页面左上角的【返回】文字或返回箭头(有时就是关闭方式);\n"
+    "- 页面/弹窗中的【关闭】文字;\n"
     "- 弹窗右上角的X图标(弹窗自带的关闭)。\n"
     "输出: {\"action\":\"CLICK\",\"x\":<0~1000>,\"y\":<0~1000>,\"reason\":\"点关闭按钮\"}\n"
-    "注意: 严禁点击【立即咨询/了解详情/进入详情页/领取/查看价格】等广告跳转按钮(那是AD_ENTRY的活, 点了会重新进广告), 只点关闭/退出按钮。"
+    "注意: 严禁点击【立即咨询/了解详情/进入详情页/领取/查看价格】等广告跳转按钮(那是AD_ENTRY的活, 点了会重新进广告), 只点关闭/退出/返回按钮。"
     "若截图看不到任何关闭/退出按钮: {\"action\":\"WAIT\",\"reason\":\"看不到关闭按钮\"}。只输出JSON。"
 )
 
@@ -201,7 +203,8 @@ SCAN_PROMPT = (
 )
 
 # 右上角关闭X的位置(相对坐标0~1000, 用户截图标定约925,107)
-CLOSE_X_REL, CLOSE_Y_REL = 925, 107
+CLOSE_X_REL, CLOSE_Y_REL = 925, 107        # 右上角X关闭(用户标定点)
+CLOSE_LEFT_X_REL, CLOSE_LEFT_Y_REL = 80, 110  # 左上角X/返回箭头(约80,110)
 
 # 主线程心跳 + watchdog
 WATCHDOG_TIMEOUT = 90     # 超过90s无任何进展判定为疑似卡死
@@ -354,7 +357,15 @@ def tap_close(ow, oh):
     """点击右上角X关闭广告(用户截图标定约925,107)"""
     x = int(CLOSE_X_REL / 1000 * ow)
     y = int(CLOSE_Y_REL / 1000 * oh)
-    log(f"[点X关闭] 坐标({x},{y})")
+    log(f"[点X关闭-右上] 坐标({x},{y})")
+    adb_tap(x, y)
+
+
+def tap_close_left(ow, oh):
+    """点击左上角X/返回箭头关闭广告(约80,110)"""
+    x = int(CLOSE_LEFT_X_REL / 1000 * ow)
+    y = int(CLOSE_LEFT_Y_REL / 1000 * oh)
+    log(f"[点X关闭-左上] 坐标({x},{y})")
     adb_tap(x, y)
 
 
@@ -497,6 +508,7 @@ class QQCoinAgent:
         self.ad_state = 0
         self.ad_watch_start = 0.0
         self.ad_close_streak = 0
+        self.ad_start_checked = False  # 是否已确认广告真正开始播放(避免只跳进内层页却傻等16s)
         self._ad_wait_streak = 0
         self._post_ad_round = False
 
@@ -979,6 +991,14 @@ class QQCoinAgent:
                 return True
         return False
 
+    def _tap_ad_start_button(self):
+        """广告内层页常需再点一次才真正开始计时(如'点击广告15秒后领取金币'/'立即观看').
+        用uiautomator优先匹配最明确的开始观看类文字, 不耗API."""
+        for kw in ("点击广告", "点击观看", "立即观看", "开始浏览", "点击此处", "点击播放"):
+            if tap_text_node(kw):
+                return True
+        return False
+
     def goto_coin_center(self):
         """从任意QQ音乐页面(首页/我的/领现金页)自动导航到金币中心.
         链路: 直接入口(看广告赚金币) -> 否则 我的 -> 领现金 -> 金币中心 ; 末用VLM兜底.
@@ -1044,6 +1064,7 @@ class QQCoinAgent:
                     if is_ad_activity() or is_in_qqmusic():
                         self.ad_state = 2   # AD_WATCH
                         self.ad_watch_start = time.time()
+                        self.ad_start_checked = False  # 待会儿确认是否真开始播放(可能还需再点一次)
                         self._ad_wait_streak = 0
                         log("[广告-已进入广告/详情页, 开始计时]")
                     else:
@@ -1081,6 +1102,54 @@ class QQCoinAgent:
                 return True
         if self.ad_state == 2:   # AD_WATCH
             elapsed = time.time() - self.ad_watch_start
+            # 进入广告后需确认是否"真正开始播放": 有些广告点第一下只是跳进内层页,
+            # 还需再点一次(点击广告/立即观看)才真正计时. 否则会傻等16s(实际没在看)→变相长等.
+            if not self.ad_start_checked and elapsed < 4:
+                time.sleep(2)  # 给内层页加载时间
+                # 先便宜地用uiautomator找"开始观看"类按钮(不耗API)
+                if self._tap_ad_start_button():
+                    log("[广告-开始观看] uiautomator命中开始观看按钮, 点击后重置计时")
+                    # 校验未跳到外部App
+                    if is_in_qqmusic() or is_ad_activity():
+                        self.ad_watch_start = time.time()
+                        self.ad_start_checked = True
+                        return True
+                    log("[广告-开始观看跳转外部App] 放弃本次广告")
+                    self.ad_state = 0
+                    self.ad_start_checked = True
+                    return True
+                # 再让VLM确认: 仍需点击才开始 / 已在计时 / 已看完
+                try:
+                    (w3, h3), b64 = capture_and_encode()
+                    action = self.call_vlm(b64, mode="ad")
+                    act = action.get("action", "WAIT")
+                except Exception:
+                    act = "WAIT"
+                if act == "CLICK":
+                    try:
+                        rx = float(action.get("x", 500)); ry = float(action.get("y", 500))
+                    except (TypeError, ValueError):
+                        rx, ry = 500, 500
+                    x = int(rx / 1000 * w3) + random.randint(-OFFSET, OFFSET)
+                    y = int(ry / 1000 * h3) + random.randint(-OFFSET, OFFSET)
+                    log(f"[广告-开始观看-VLM] 坐标({x},{y}) reason={action.get('reason', '')}")
+                    adb_tap(x, y)
+                    if is_in_qqmusic() or is_ad_activity():
+                        self.ad_watch_start = time.time()
+                        self.ad_start_checked = True
+                        return True
+                    log("[广告-开始观看跳转外部App] 放弃本次广告")
+                    self.ad_state = 0
+                    self.ad_start_checked = True
+                    return True
+                elif act == "CLOSE":
+                    log("[广告-开始观看时已看完] " + action.get("reason", ""))
+                    self.ad_state = 4   # AD_CLOSE
+                    self.ad_start_checked = True
+                    return True
+                else:
+                    # WAIT/其它, 视为已在计时
+                    self.ad_start_checked = True
             if elapsed < AD_WATCH_SECONDS:
                 remain = max(1, AD_WATCH_SECONDS - elapsed)
                 log(f"[广告-详情页浏览] 已看{elapsed:.0f}s, 还需{remain:.0f}s")
@@ -1127,9 +1196,19 @@ class QQCoinAgent:
                 self.ad_state = 0
             else:
                 if self.ad_close_streak == 0:
-                    # 优先: uiautomator 找左上角'退出'文字(用户确认可直接退出广告), 不耗API
-                    if tap_text_node("退出", exclude=("退出登录", "退出账号"), bias_right=True):
-                        log("[广告-点退出] 命中左上角'退出'文字, 尝试关闭广告")
+                    # 优先: uiautomator 找关闭文字(退出/返回/关闭), 不耗API.
+                    # 场景: 左上角'退出'提示栏 / 左上角'返回'箭头 / 弹窗'关闭'文字
+                    closed = False
+                    if tap_text_node("退出", exclude=("退出登录", "退出账号", "退出登录账号"), bias_right=True):
+                        log("[广告-点关闭] 命中左上角'退出'文字, 尝试关闭广告")
+                        closed = True
+                    elif tap_text_node("返回", exclude=("返回首页", "返回顶部", "返回上一级")):
+                        log("[广告-点关闭] 命中左上角'返回'文字, 尝试关闭广告")
+                        closed = True
+                    elif tap_text_node("关闭", exclude=("关闭广告", "关闭推送", "关闭免密")):
+                        log("[广告-点关闭] 命中'关闭'文字, 尝试关闭广告")
+                        closed = True
+                    if closed:
                         self.ad_close_streak += 1
                         time.sleep(random.uniform(2, 4))
                     else:
@@ -1155,8 +1234,10 @@ class QQCoinAgent:
                         self.ad_close_streak += 1
                         time.sleep(random.uniform(3, 5))
                 elif self.ad_close_streak == 1:
-                    log("[广告-仍在广告页] BACK后再试固定右上角X")
-                    tap_close(ow, oh)
+                    log("[广告-仍在广告页] 试固定右上角X + 左上角X/返回箭头")
+                    tap_close(ow, oh)           # 右上角X
+                    time.sleep(1.0)
+                    tap_close_left(ow, oh)      # 左上角X/返回箭头
                     self.ad_close_streak += 1
                     time.sleep(random.uniform(3, 5))
                 else:
@@ -1362,10 +1443,19 @@ class QQCoinAgent:
                 if self._on_coin_center():
                     log("[收尾] 已回到QQ音乐金币中心")
                     return
-            # 广告页: 先试左上角'退出'文字, 再试固定右上角X关闭, 再BACK
+            # 广告页: 先试关闭文字(退出/返回/关闭), 再试固定右上角X/左上角X关闭, 再BACK
             if is_ad_activity():
-                if tap_text_node("退出", exclude=("退出登录", "退出账号"), bias_right=True):
+                closed = False
+                if tap_text_node("退出", exclude=("退出登录", "退出账号", "退出登录账号"), bias_right=True):
                     log("[收尾] 已点'退出'尝试关闭广告")
+                    closed = True
+                elif tap_text_node("返回", exclude=("返回首页", "返回顶部", "返回上一级")):
+                    log("[收尾] 已点'返回'尝试关闭广告")
+                    closed = True
+                elif tap_text_node("关闭", exclude=("关闭广告", "关闭推送", "关闭免密")):
+                    log("[收尾] 已点'关闭'尝试关闭广告")
+                    closed = True
+                if closed:
                     time.sleep(1.5)
                     continue
                 try:
@@ -1373,7 +1463,9 @@ class QQCoinAgent:
                     ow, oh = Image.open(SCREEN_PATH).size
                 except Exception:
                     ow, oh = 1080, 2400
-                tap_close(ow, oh)
+                tap_close(ow, oh)          # 右上角X
+                time.sleep(1.0)
+                tap_close_left(ow, oh)     # 左上角X/返回箭头
                 time.sleep(1.0)
             adb_back()
             time.sleep(1.0)
