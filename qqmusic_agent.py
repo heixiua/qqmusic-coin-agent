@@ -38,6 +38,8 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from PIL import Image
 
+from vision_perception import Vision, Policy
+
 # ================= 配置区 =================
 # adb 完整路径(避免没进 PATH)
 ADB = r"D:\桌面\xdf\Agent工程与具身智能\安卓手机控制\platform-tools\platform-tools\adb.exe"
@@ -59,11 +61,17 @@ AD_WATCH_MAX_SECONDS = 31   # [已停用] 旧版30秒视频继续等待上限; �
 # 广告门页("点击后看15秒, 可获得奖励")上真正能进入广告的区域: 视频画面中心(千分比)。
 # 实拍帧确认: 底部"立即下载/立即浏览"按钮点击常被视频层吞掉, BACK/X 也被门页拦截。
 AD_DOOR_VIDEO_X_REL, AD_DOOR_VIDEO_Y_REL = 500, 600
+# 门页底部 CTA("点击浏览15秒"/"立即下载")位置: 实测在屏高约 87% 处(dump 读不到文字, 只能按坐标)
+AD_DOOR_CTA_X_REL, AD_DOOR_CTA_Y_REL = 500, 870
 EXTERNAL_INCENTIVE_WAIT = 5 # 激励"浏览5秒"跳商店/浏览器后, 至少等5秒再BACK(否则金币不到账)
 OFFSET = 12               # 点击坐标随机偏移(千分比坐标下偏移1.2%)
 SKIP_PROB = 0.08          # 随机跳过本轮概率(反风控)
 RESIZE_WIDTH = 800        # 送模型的图片宽度
 SCREEN_PATH = "screen_tmp.png"
+
+# ===== 本地视觉感知(离线, 不调模型) =====
+VISION = Vision(ADB)            # 帧指纹 / UI条带差分 / 等页面变化
+POLICY = Policy("visual_policy.json")   # 视觉指纹 → 动作 记忆库(命中就不调VLM)
 
 # ===== 金币页硬编码优先(减少AI调用) =====
 # 用户指定只刷: ①看视频领金币/看视频得高额金币(按钮文本=看视频) ②抽奖赢金币(立即抽奖) ③金币抽奖页(看广告抽奖)
@@ -409,10 +417,37 @@ def tap_close_left(ow, oh):
     adb_tap(x, y)
 
 
+def ad_done_text(xml):
+    """门页/广告页是否已显示"奖励已获得"。
+    坑: 门页本身的文案是"观看完视频，**可获得奖励**", 里面含"获得奖励";
+    旧版把裸词"获得奖励"当完成信号 → 刚进门页就判"已完成" → 不点CTA、直接BACK/关闭,
+    广告根本没看, 金币0到账。故先把"可获得奖励/可得奖励"这类未完成语境剔除, 再匹配完成词。"""
+    if not xml:
+        return False
+    x = xml.replace("可获得奖励", "").replace("可得奖励", "").replace("观看完视频", "")
+    return any(w in x for w in ("已获得奖励", "已完成", "恭喜已获得", "已领取", "奖励已到账"))
+
+
 def tap_close_smart(ow, oh):
-    """智能关闭广告: 先在右上角区域找广告SDK自己的可点小节点(位置随广告而变), 找不到再按候选坐标逐个试,
-    每点一次立即复查是否已离开广告, 命中就停手。
-    实测不同广告的关闭X位置不同(红果在下排控制条 y≈107‰, 抖音在顶部 y≈67‰), 单一固定坐标必然漏。"""
+    """智能关闭广告, 按"代价从低到高"三级尝试, 每点一次都用 UI 条带差分 + 是否离开广告 双重复查:
+      1) 4 个候选坐标(不同广告SDK的X位置不同, 红果在下排控制条 y≈107, 抖音在顶部 y≈67) —— 不耗 dump
+      2) 挽留窗"现在退出就没有奖励哦"的"放弃奖励"(WebView 里 dump 读不到文字, 只能固定坐标)
+      3) 最后才 uiautomator dump 找右上角可点节点(2-8s, 兜底)
+    旧版把 dump 放最前面, 每次关闭都白花 2-8s, 其实 1)+2) 就能覆盖绝大多数广告。"""
+    sig = VISION.strip_sig(VISION.grab())
+    for rx, ry in CLOSE_CANDIDATES:
+        adb_tap(int(rx / 1000 * ow), int(ry / 1000 * oh))
+        ch, sig, dt = VISION.wait_change(sig, timeout=1.0)
+        log(f"[点X关闭-候选] ({rx},{ry}) " + (f"页面{dt:.1f}s后变化" if ch else "页面无变化"))
+        if not is_ad_activity():
+            return True
+    adb_tap(int(AD_GIVEUP_X_REL / 1000 * ow), int(AD_GIVEUP_Y_REL / 1000 * oh))
+    ch, sig, dt = VISION.wait_change(sig, timeout=1.5)
+    log(f"[点X关闭-放弃奖励] ({AD_GIVEUP_X_REL},{AD_GIVEUP_Y_REL}) " +
+        (f"页面{dt:.1f}s后变化" if ch else "页面无变化"))
+    if not is_ad_activity():
+        return True
+    # 兜底: dump 找右上角区域可点小节点(慢)
     xml = dump_uia_xml()
     if xml:
         cands = []
@@ -432,20 +467,10 @@ def tap_close_smart(ow, oh):
             _, cx, cy = cands[0]
             log(f"[点X关闭-智能] 右上角可点节点({cx},{cy})")
             adb_tap(cx, cy)
-            time.sleep(1.2)
+            VISION.wait_change(sig, timeout=1.0)
             if not is_ad_activity():
                 return True
-    for rx, ry in CLOSE_CANDIDATES:
-        adb_tap(int(rx / 1000 * ow), int(ry / 1000 * oh))
-        log(f"[点X关闭-候选] ({rx},{ry})")
-        time.sleep(1.2)
-        if not is_ad_activity():
-            return True
-    # 还关不掉: 多半是弹了"现在退出就没有奖励哦"挽留窗 → 按固定坐标点"放弃奖励"
-    adb_tap(int(AD_GIVEUP_X_REL / 1000 * ow), int(AD_GIVEUP_Y_REL / 1000 * oh))
-    log(f"[点X关闭-放弃奖励] 挽留窗固定坐标({AD_GIVEUP_X_REL},{AD_GIVEUP_Y_REL})")
-    time.sleep(1.5)
-    return not is_ad_activity()
+    return False
 
 
 def dump_uia_xml():
@@ -665,6 +690,7 @@ class QQCoinAgent:
         # 坐标缓存: 首次用VLM点中"看视频"后记住坐标, 后续轮直接点(省VLM). 校验失败自动清空.
         self._video_btn_pos = None
         self._door_tap_ts = 0.0   # 上次点"广告门页视频区"的时间(20s冷却, 防每轮重复点)
+        self._cur_fp = b""        # 本屏视觉指纹(供视觉记忆库回流用)
 
     # ---------- 记忆 / 心跳 ----------
     def remember_action(self, action, reason=""):
@@ -925,6 +951,34 @@ class QQCoinAgent:
             self.heartbeat()
             return "CLICK"
 
+        # 视觉记忆库(规则库的视觉版): 这一屏之前用VLM点成功过 → 直接复用坐标, 不调VLM.
+        # 校验用"UI条带有没变化"(不是固定 sleep), 没变就记一次失败并回退 VLM, 可自纠正。
+        _img = VISION.grab()
+        _fp = VISION.page_fp(_img) if _img is not None else b""
+        self._cur_fp = _fp
+        if _fp:
+            hit = POLICY.lookup(_fp)
+            if hit:
+                _xr, _yr = hit
+                _w, _h = _img.size
+                _x, _y = int(_xr / 1000 * _w), int(_yr / 1000 * _h)
+                _prev = VISION.strip_sig(_img)
+                log(f"[视觉记忆] 命中已知页面, 直接点({_xr},{_yr}) 尝试省VLM")
+                try:
+                    adb_tap(_x, _y)
+                except Exception as e:
+                    log(f"[视觉记忆] 点击异常 {str(e)[:30]}")
+                _changed, _, _dt = VISION.wait_change(_prev, timeout=2.2)
+                if _changed:
+                    log(f"[视觉记忆] 命中(页面 {_dt:.1f}s 后变化), 省去一次VLM")
+                    self._last_had_click = True
+                    self.remember_action("CLICK", "视觉记忆")
+                    w = random.uniform(WAIT_MIN, WAIT_MAX)
+                    time.sleep(w)
+                    return "CLICK"
+                log("[视觉记忆] 点击后页面无变化, 记一次失败 → 回退VLM")
+                POLICY.penalize(_fp, _xr, _yr)
+
         # 快路径(坐标缓存): 若本会话曾用VLM成功点中"看视频"按钮, 记住坐标, 后续轮先直接点该坐标,
         # 点后校验是否真的离开金币页(进广告/外部App/离开QQ音乐), 成功则省去一次VLM(~15-19s);
         # 若没进入广告说明布局变了/被弹窗挡住, 立即清缓存回退VLM(自纠正, 不会一直点偏).
@@ -1018,6 +1072,10 @@ class QQCoinAgent:
                     # 记住VLM点中的"看视频"坐标, 后续轮直接复用, 省去重复VLM(布局稳定时命中率高)
                     self._video_btn_pos = (x, y)
                     log(f"[坐标缓存] 记录'看视频'按钮坐标({x},{y})供后续轮复用")
+                # 回流到视觉记忆库: 该页面指纹 → 该相对坐标, 下次同一屏直接点, 不再问VLM
+                if self._cur_fp:
+                    POLICY.record(self._cur_fp, rx, ry)
+                    log(f"[视觉记忆] 已入库 页面→({rx:.0f},{ry:.0f})")
         elif act == "SWIPE":
             log(f"[下滑:{provider}] reason={reason}")
             adb_swipe_up()
@@ -1176,12 +1234,13 @@ class QQCoinAgent:
 
     # ---------- 自动导航到金币中心 ----------
     def _on_ad_door_page(self):
-        """是否停在广告"门页"(左上角'点击后看15秒, 可获得奖励' + 底部'立即下载/立即浏览').
-        该页只是外壳, 不是真广告; 点视频区才会真正进入广告并开始计时。"""
+        """是否停在广告"门页"(点进去看 X 秒才给奖励的那层外壳)。
+        文字信号实测只有这几句 dump 读得到: "观看完视频，可获得奖励" / "点击后看15秒，可获得奖励"。
+        (注意: 正因为这句含"获得奖励", 旧的完成判断会把它误当成"已完成")"""
         xml = _LAST_DUMP_XML or dump_uia_xml()
         if not xml:
             return False
-        return ("点击后" in xml) and (("可得奖励" in xml) or ("可获得奖励" in xml))
+        return any(w in xml for w in ("可获得奖励", "可得奖励", "观看完视频"))
 
     def _on_ledger_page(self):
         """是否停在"记录(金币明细)"页。该页是金币中心同一页面栈里的覆盖层,
@@ -1289,17 +1348,26 @@ class QQCoinAgent:
         if self.ad_state == 0:   # AD_IDLE
             return False
         if self.ad_state == 1:   # AD_ENTRY
-            # 门页专项(实拍截图确认): "点击后看15秒, 可获得奖励" 这层只是一张皮,
-            # 底部"立即下载/立即浏览"按钮常被视频层吞掉点了没反应, BACK/X 也被拦;
-            # 真正能进入广告(并开始计时)的是点视频画面本身。故先按固定比例点视频区, 省一次VLM。
+            if not _LAST_DUMP_XML:
+                dump_uia_xml()      # 一次dump(~2-8s), 后续判断复用; 比 VLM(20-30s) 便宜得多
+            # ① 广告已看完(真·已获得奖励) → 不要重复点入口, 直接转关闭
+            if ad_done_text(_LAST_DUMP_XML):
+                log("[广告-入口] 门页确已'已获得奖励/已完成', 不重复点击, 转关闭返回")
+                self.ad_state = 4   # AD_CLOSE
+                return True
+            # ② 门页(文案"观看完视频，可获得奖励"): 之前误把这句话当成"已完成"(含"获得奖励"子串),
+            #    导致刚进门页就跳过点击、直接关闭 → 广告没看, 金币0到账。
+            #    现在正确动作是点底部 CTA("点击浏览15秒"/"立即下载", 实测在屏高约87%处, dump读不到文字)。
             if self._on_ad_door_page() and time.time() - self._door_tap_ts > 20:
                 self._door_tap_ts = time.time()
                 _secs = parse_seconds_from_screen(_LAST_DUMP_XML) or AD_DEFAULT_AD_SECONDS
-                x = int(AD_DOOR_VIDEO_X_REL / 1000 * ow)
-                y = int(AD_DOOR_VIDEO_Y_REL / 1000 * oh)
-                log(f"[广告-门页] 识别到'点击后看{_secs}秒'门页, 点视频区({AD_DOOR_VIDEO_X_REL},{AD_DOOR_VIDEO_Y_REL})进入广告")
+                x = int(AD_DOOR_CTA_X_REL / 1000 * ow)
+                y = int(AD_DOOR_CTA_Y_REL / 1000 * oh)
+                log(f"[广告-门页] 门页(看{_secs}秒可得奖励), 点底部CTA({AD_DOOR_CTA_X_REL},{AD_DOOR_CTA_Y_REL})进入广告")
+                _prev = VISION.strip_sig(VISION.grab())
                 adb_tap(x, y)
-                time.sleep(1.5)
+                _ch, _, _dt = VISION.wait_change(_prev, timeout=2.0)
+                log(f"[广告-门页] 点后" + (f"页面 {_dt:.1f}s 后跳转" if _ch else "页面无变化(CTA可能被视频层吞掉)"))
                 self.ad_state = 2   # AD_WATCH
                 self.ad_watch_start = time.time()
                 self._ad_expected_wait = _secs
@@ -1312,7 +1380,8 @@ class QQCoinAgent:
             if self._tap_ad_start_button():
                 _secs = parse_seconds_from_screen(_LAST_TEXT_MATCH)
                 log(f"[广告-入口] uiautomator命中开始/浏览按钮(读到{_secs}s), 直接点击(省去VLM)")
-                time.sleep(1.5)
+                _ch, _, _dt = VISION.wait_change(VISION.strip_sig(VISION.grab()), timeout=1.8)
+                log(f"[广告-入口] 点后" + (f"页面 {_dt:.1f}s 后跳转" if _ch else "页面无变化"))
                 # 点门页CTA那一刻 = 计时起点; 无论进容器广告还是跳商店, 都等满 _secs 再回
                 self._ad_expected_wait = _secs
                 self._wait_until = time.time() + _secs
@@ -1325,11 +1394,33 @@ class QQCoinAgent:
                 else:
                     log(f"[广告-跳转外部App, 按{_secs}s计时, 满后再BACK回QQ音乐]")
                 return True
-            # 门页若已显示"已获得奖励/已完成"(广告已看完), 不要重复点入口, 直接转关闭返回
-            if any(w in _LAST_DUMP_XML for w in ("已获得奖励", "已完成", "恭喜已获得", "已领取", "获得奖励")):
-                log("[广告-入口] 门页已是'已获得奖励/已完成', 不重复点击, 转关闭返回")
-                self.ad_state = 4   # AD_CLOSE
-                return True
+            # 视觉记忆库: 这个广告页之前点成功过 → 直接复用坐标, 不再问VLM(省 20-30s)
+            _img = VISION.grab()
+            _fp = VISION.page_fp(_img) if _img is not None else b""
+            self._cur_fp = _fp
+            if _fp:
+                _hit = POLICY.lookup(_fp)
+                if _hit:
+                    _xr, _yr = _hit
+                    _w, _h = _img.size
+                    _px, _py = int(_xr / 1000 * _w), int(_yr / 1000 * _h)
+                    _prev = VISION.strip_sig(_img)
+                    log(f"[视觉记忆-广告] 命中已知广告页, 直接点({_xr},{_yr}) 尝试省VLM")
+                    adb_tap(_px, _py)
+                    _ch, _, _dt = VISION.wait_change(_prev, timeout=2.2)
+                    _secs = AD_DEFAULT_AD_SECONDS
+                    self._ad_expected_wait = _secs
+                    self._wait_until = time.time() + _secs
+                    self.ad_watch_start = time.time()
+                    self.ad_start_checked = True
+                    self._ad_wait_streak = 0
+                    self.ad_state = 2   # AD_WATCH
+                    if _ch:
+                        log(f"[视觉记忆-广告] 命中(页面 {_dt:.1f}s 后变化), 按{_secs}s计时, 省去VLM")
+                        return True
+                    log("[视觉记忆-广告] 点后页面无变化, 记一次失败但仍按计时推进(避免耗轮次)")
+                    POLICY.penalize(_fp, _xr, _yr)
+                    return True
             try:
                 (w2, h2), b64 = capture_and_encode()
                 action = self.call_vlm(b64, mode="ad")
@@ -1361,6 +1452,9 @@ class QQCoinAgent:
                     self.ad_start_checked = any(w in _reason for w in _start_words)
                     self._ad_wait_streak = 0
                     self.ad_state = 2   # AD_WATCH
+                    if self._cur_fp:
+                        POLICY.record(self._cur_fp, rx, ry)   # 回流: 该广告页 → 该坐标
+                        log(f"[视觉记忆-广告] 已入库 ({rx:.0f},{ry:.0f})")
                     if is_ad_activity() or is_in_qqmusic():
                         log(f"[广告-已进入广告/详情页, 计时 {_secs}s]" +
                             ("(入口即开始按钮)" if self.ad_start_checked else ""))
@@ -1462,7 +1556,7 @@ class QQCoinAgent:
                         log(f"[广告-点关闭] 命中'{hit}'文字, 尝试关闭广告")
                         self.ad_close_streak += 1
                         time.sleep(random.uniform(2, 4))
-                    elif any(w in _LAST_DUMP_XML for w in ("已获得奖励", "已完成", "恭喜已获得", "已领取", "获得奖励")):
+                    elif ad_done_text(_LAST_DUMP_XML):
                         # 门页"点击后浏览15秒"看完后左上角会变"恭喜已获得奖励/已完成XXX" → 说明已成功, BACK回金币页
                         log("[广告-门页完成] 识别到'已获得奖励/已完成', BACK回金币页领币")
                         adb_back()
