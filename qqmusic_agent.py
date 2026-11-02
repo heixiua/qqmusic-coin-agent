@@ -103,8 +103,13 @@ SYSTEM_PROMPT = (
     "- 【天天抽奖/免费得好礼】整页抽奖机页(页面显示'看广告抽奖'和'剩余看广告次数 X/10'): "
     "X>0 → {\"action\":\"CLICK\",\"x\":<0~1000>,\"y\":<0~1000>,\"reason\":\"点看广告抽奖\"}; "
     "X=0/次数已用完且页面不能下滑 → {\"action\":\"BACK\",\"reason\":\"天天抽奖次数已用完,返回金币页\"}, 严禁SWIPE。\n"
+    "- 【用动作历史判断卡住(重要)】输入会附带'最近动作历史(旧→新)', 这是你前几轮真实执行的动作: "
+    "①连续3次以上SWIPE且中间没有任何CLICK = 你在原地重复下滑(页面不可滚动或已到底), 禁止再SWIPE; "
+    "整页活动页(天天抽奖/免费得好礼/抽奖机/详情页) → BACK; 金币任务列表页 → TOP(回页面顶部重新扫描); "
+    "②动作历史里SWIPE/CLICK交替, 或每轮之间有CLICK(看广告抽奖/浏览5秒/看视频) = 正常的连续刷广告, 不算卡住, 继续按任务规则点击。\n"
     "\n"
     "输出规则:\n"
+    "- 金币任务列表连续下滑卡住, 需要回到页顶重新扫描: {\"action\":\"TOP\",\"reason\":\"回顶部重新扫描\"}\n"
     "- 金币页看到可点击任务按钮(上述6类): {\"action\":\"CLICK\",\"x\":<0~1000>,\"y\":<0~1000>,\"reason\":\"点击什么\"}\n"
     "- 屏幕任务全部不可点/已领过/只剩用户自己刷的任务: {\"action\":\"SWIPE\",\"reason\":\"下滑看更多\"}\n"
     "- 拿不准: {\"action\":\"SWIPE\",\"reason\":\"不确定,下滑看看\"}\n"
@@ -144,30 +149,6 @@ AD_CLOSE_PROMPT = (
     "若截图看不到任何关闭/退出按钮: {\"action\":\"WAIT\",\"reason\":\"看不到关闭按钮\"}。只输出JSON。"
 )
 
-# watchdog 卡住自救专用prompt: 先保住奖励再退出, BACK只作最后手段
-RESCUE_PROMPT = (
-    "你是卡死自救Agent。脚本已连续10轮截图几乎不变(判定卡住), 现在要决定一次自救动作。"
-    "分析截图, 只输出一个JSON对象, 不要多余文字。\n"
-    "原则: 优先保住金币奖励, 能点按钮就不要退出; 尽量不BACK, BACK只作最后手段且只返回一次。\n"
-    "1. 金币页弹出【继续浏览可额外获得XX金币/浏览5秒再领/观看下一条/观看完成+金币】任务弹窗: "
-    "{\"action\":\"CLICK\",\"x\":<0~1000>,\"y\":<0~1000>,\"reason\":\"点继续浏览领奖励, 不要退出\"}。"
-    "点奖励按钮本身(继续浏览/立即领取/看视频), 严禁点X或返回, 否则丢奖励任务。\n"
-    "2. 金币任务页(有金币狂欢节/看视频领金币等任务列表)但没有可点任务: "
-    "{\"action\":\"SWIPE\",\"reason\":\"金币页下滑找任务\"}。\n"
-    "3. 广告页/H5详情页/广告弹窗(有广告内容、倒计时、恭喜获得奖励、右上角X/关闭/退出): "
-    "{\"action\":\"CLOSE\",\"x\":<0~1000>,\"y\":<0~1000>,\"reason\":\"点关闭X退出广告\"}。"
-    "只点关闭/退出按钮, 严禁点了解详情/立即咨询/下载等广告跳转按钮。\n"
-    "4. 歌曲播放页/视频播放页(专辑封面、播放进度条、暂停键、歌曲名): "
-    "{\"action\":\"PLAY_WAIT\",\"reason\":\"播放页,听满15秒再返回\"}。\n"
-    "5. QQ音乐首页(顶部推荐/刷歌/乐馆标签、底部导航栏): 点底部【我的】→ "
-    "{\"action\":\"CLICK\",\"x\":<0~1000>,\"y\":<0~1000>,\"reason\":\"点底部我的, 导航回金币页\"}。\n"
-    "6. 我的个人中心页(头像/昵称/我的资产): 找【领现金】入口→ "
-    "{\"action\":\"CLICK\",\"x\":<0~1000>,\"y\":<0~1000>,\"reason\":\"点领现金, 导航回金币页\"}。\n"
-    "7. 登录/注册/商品页/第三方App/空白页/其他无法判断: "
-    "{\"action\":\"BACK\",\"reason\":\"无法利用的页面, 返回一次\"}。\n"
-    "只输出JSON。"
-)
-
 # 导航回金币页prompt: 误退到首页/我的时, 让AI一步步点回金币狂欢节(坐标仍由AI看截图给出, 不硬编码)
 NAV_PROMPT = (
     "你是QQ音乐页面导航Agent。脚本当前离开了【金币狂欢节】任务页, 需要一步步导航回去。"
@@ -196,24 +177,22 @@ def log(msg):
     except Exception:
         pass
 
-# ===== watchdog: 画面相似度卡住检测 =====
-WD_SIM_ROUNDS = 10      # 连续N轮画面相似度>=90% -> 判卡住(用户指定)
+# ===== 动作历史(给模型的短期记忆, 防止原地重复) =====
+_recent_actions = []   # [(action, reason)]
+
+def remember_action(action, reason=""):
+    """记录本轮真实动作, 最多保留10条, 作为下一轮AI判断是否卡住的依据"""
+    _recent_actions.append((str(action), str(reason)[:20]))
+    if len(_recent_actions) > 10:
+        del _recent_actions[:-10]
+
+def action_history_text(n=6):
+    if not _recent_actions:
+        return "（无）"
+    return " -> ".join(f"{a}({r})" if r else a for a, r in _recent_actions[-n:])
+
+# ===== 卡住样本采样(保留给 evolver 使用, 不再是AI自救触发) =====
 SAMPLE_DIR = Path("ad_samples")   # 卡住样本存放目录
-
-def calc_screen_sig(path, size=(16, 16)):
-    """计算截图特征: 缩略图灰度像素列表(用于相似度比较)"""
-    try:
-        img = Image.open(path).convert("L").resize(size, Image.LANCZOS)
-        return list(img.getdata())
-    except Exception:
-        return None
-
-def sig_similar(a, b, thresh=0.90):
-    """两个特征是否相似度>=thresh (像素差>8 视为不同, 相同比例>=thresh)"""
-    if not a or not b or len(a) != len(b):
-        return False
-    diffs = sum(1 for x, y in zip(a, b) if abs(x - y) > 8)
-    return 1 - diffs / len(a) >= thresh
 
 def save_sample(round_no, reason):
     """卡住时被动采样: 3张间隔截图 + 上下文(日志尾部/焦点/状态) 到 ad_samples/<ts>_r<n>/"""
@@ -305,8 +284,11 @@ def call_vlm(img_b64, mode="normal"):
     last_err = None
     sys_prompt = (AD_ENTRY_PROMPT if mode == "ad" else
                   AD_CLOSE_PROMPT if mode == "close" else
-                  RESCUE_PROMPT if mode == "rescue" else
                   NAV_PROMPT if mode == "nav" else SYSTEM_PROMPT)
+    # 金币页常规判断时附上最近动作历史(纯文本短期记忆), 让模型能看到自己在重复什么
+    user_text = "分析这张手机截图，按规则输出JSON。"
+    if mode == "normal":
+        user_text = f"最近动作历史(旧→新): {action_history_text()}\n" + user_text
     for p in VLM_PROVIDERS:
         api_key = os.getenv(p["api_key_env"])
         if not api_key:
@@ -335,7 +317,7 @@ def call_vlm(img_b64, mode="normal"):
                 messages=[
                     {"role": "system", "content": sys_prompt},
                     {"role": "user", "content": [
-                        {"type": "text", "text": "分析这张手机截图，按规则输出JSON。"},
+                        {"type": "text", "text": user_text},
                         {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}},
                     ]},
                 ],
@@ -542,6 +524,7 @@ def run_once():
         except Exception as e:
             log(f"[点击失败] {e}")
         _last_had_click = True
+        remember_action("CLICK", "硬编码")
         w = random.uniform(WAIT_MIN, WAIT_MAX)
         log(f"[等待] {w:.1f}s")
         time.sleep(w)
@@ -554,6 +537,7 @@ def run_once():
         time.sleep(5)
         return "FAIL"
 
+    log(f"[记忆] 最近动作: {action_history_text()}")
     action = call_vlm(b64)
     act = action.get("action", "WAIT")
     provider = action.get("_provider", "?")
@@ -581,6 +565,12 @@ def run_once():
     elif act == "SWIPE":
         log(f"[下滑:{provider}] reason={reason}")
         adb_swipe_up()
+    elif act == "TOP":
+        # 模型根据动作历史判断"原地重复下滑" → 滚回页面顶部重新扫描
+        log(f"[回顶部:{provider}] reason={reason}")
+        for _ in range(6):
+            adb_swipe_down()
+            time.sleep(0.6)
     elif act == "PLAY_WAIT":
         # 播放页: 等满15秒金币到账再BACK, 不能立刻返回丢奖励
         log(f"[播放页:{provider}] reason={reason}")
@@ -627,8 +617,10 @@ def run_once():
 
     if act != "PLAY_WAIT":
         _play_wait_start = 0.0   # 页面已不是播放页, 计时复位
-    if act in ("CLICK", "SWIPE", "PLAY_WAIT", "WAIT"):
+    if act in ("CLICK", "SWIPE", "TOP", "PLAY_WAIT", "WAIT"):
         _back_streak = 0         # 页面已有正常动作, BACK计数复位
+
+    remember_action(act, reason)   # 记录真实动作, 供下一轮AI判断是否原地重复
 
     w = random.uniform(WAIT_MIN, WAIT_MAX)
     log(f"[等待] {w:.1f}s")
@@ -672,11 +664,7 @@ def main():
 
     n = 0
     wait_streak = 0   # 连续WAIT计数, 连续3次强制BACK兜底
-    swipe_streak = 0  # 连续SWIPE计数, 连续8次强制BACK回顶部
-
-    # ===== watchdog 状态 =====
-    _last_sig = None      # 上一轮画面指纹
-    _wd_streak = 0        # 连续相似轮数(>=WD_SIM_ROUNDS 判卡住)
+    swipe_streak = 0  # 连续SWIPE计数, 连续6次滚回页面顶部
 
     # ===== 广告流程状态机 (代码强制流转, 不靠模型猜状态) =====
     # AD_IDLE=0 正常金币页 | AD_ENTRY=1 刚进广告页→点跳转按钮(了解详情/立即咨询)
@@ -841,71 +829,6 @@ def main():
         n += 1
         log(f"===== 第 {n}/{rounds} 轮 =====")
 
-        # ===== watchdog: 画面相似度卡住检测(用户指定: 同广告刷10轮相似度>=90%判卡住) =====
-        # 每轮先截屏做画面指纹, 连续WD_SIM_ROUNDS轮相似 -> 画面没动 -> 判定卡住(不再信日志)
-        try:
-            _wd_sig = calc_screen_sig(SCREEN_PATH)
-            if _wd_sig is not None:
-                if _last_sig is not None and sig_similar(_last_sig, _wd_sig):
-                    _wd_streak += 1
-                else:
-                    _wd_streak = 0
-                _last_sig = _wd_sig
-                if _wd_streak >= WD_SIM_ROUNDS:
-                    log(f"[watchdog] 连续{WD_SIM_ROUNDS}轮画面相似度>=90%, 判定卡住(画面未动)")
-                    save_sample(n, "画面连续相似>=90%")
-                    _wd_streak = 0
-                    _last_sig = None
-                    _last_uia_pos = None; _uia_streak = 0
-                    wait_streak = 0; swipe_streak = 0
-                    _ad_wait_streak = 0
-                    # 自救: 先让AI看页面决定动作(优先点"继续浏览"保奖励/点X关闭, BACK只作最后手段且只1次)
-                    ract = "BACK"
-                    try:
-                        (wd_w, wd_h), wd_b64 = capture_and_encode()
-                        rescue = call_vlm(wd_b64, mode="rescue")
-                        ract = rescue.get("action", "BACK")
-                        log(f"[watchdog-自救] AI判断={ract} reason={rescue.get('reason','')}")
-                        if ract in ("CLICK", "CLOSE"):
-                            try:
-                                rx = float(rescue.get("x", 500)); ry = float(rescue.get("y", 500))
-                            except (TypeError, ValueError):
-                                rx, ry = 500, 500
-                            x = int(rx / 1000 * wd_w) + random.randint(-OFFSET, OFFSET)
-                            y = int(ry / 1000 * wd_h) + random.randint(-OFFSET, OFFSET)
-                            log(f"[watchdog-自救] 点击({x},{y})")
-                            adb_tap(x, y)
-                        elif ract == "SWIPE":
-                            adb_swipe_up()
-                        elif ract == "PLAY_WAIT":
-                            if play_wait_then_back("watchdog自救") == "BACK":
-                                ract = "BACK"   # 已听满15秒并BACK
-                        else:
-                            ract = "BACK"
-                            log("[watchdog-自救] BACK一次(最后手段)")
-                            adb_back()
-                    except Exception as e:
-                        log(f"[watchdog-自救AI失败] {str(e)[:40]}, BACK一次")
-                        ract = "BACK"
-                        adb_back()
-                    # 自救后状态衔接: 点X->交给关闭状态确认; BACK->确认是否离开广告; 其余回金币页流程
-                    if ract == "CLOSE":
-                        ad_close_streak = 0
-                        ad_state = AD_CLOSE
-                    elif ract == "BACK":
-                        ad_state = AD_BACK
-                    elif ract == "CLICK" and is_ad_activity():
-                        ad_state = AD_WATCH       # 点的是广告跳转/浏览按钮, 重新开始计时
-                        ad_watch_start = time.time()
-                    else:
-                        ad_state = AD_IDLE
-                    if ract != "PLAY_WAIT":
-                        _play_wait_start = 0.0
-                    time.sleep(random.uniform(3, 6))
-                    continue
-        except Exception as e:
-            log(f"[watchdog] 检测异常: {str(e)[:50]}")
-
         # 兜底0(最高优先): 误点了跳转第三方App的任务(京东/淘宝等), 焦点已离开QQ音乐 → 强制返回
         if not is_in_qqmusic() and not is_ad_activity():
             log("[兜底0] 误跳第三方App, 逐次BACK回QQ音乐(不再一次连按5次, 避免退过头到首页)")
@@ -942,9 +865,10 @@ def main():
             adb_back()
             wait_streak = 0
             time.sleep(random.uniform(3, 6))
-        # 兜底2: 连续下滑到底 → 滚回页面顶部重新扫描(不用BACK, 避免退到首页/我的)
+        # 兜底2: 连续下滑到底 → 采样 + 滚回页面顶部重新扫描(不用BACK, 避免退到首页/我的)
         if swipe_streak >= 6:
-            log("[兜底] 连续6次下滑到底, 滚回金币页顶部重新扫描")
+            log("[兜底] 连续6次下滑到底, 采样并滚回金币页顶部重新扫描")
+            save_sample(n, "连续6次下滑到底")
             for _ in range(6):
                 adb_swipe_down()
                 time.sleep(0.8)
