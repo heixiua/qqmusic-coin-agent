@@ -373,6 +373,9 @@ _play_wait_start = 0.0
 # 连续BACK计数: 离开金币页后反复BACK只会退到首页/桌面, 第2次起暂停等用户手动回金币页
 _back_streak = 0
 
+# 广告刚关闭标记: 关广告后露出的播放页是残留页面, 不需要再等15秒
+_post_ad_round = False
+
 def play_wait_then_back(reason=""):
     """播放页: 首轮开始计时, 等满PLAY_WAIT_SECONDS再BACK一次; 未满先等待. 返回PLAY_WAIT或BACK"""
     global _play_wait_start
@@ -493,7 +496,9 @@ def _match_task_keyword(txt):
 
 def run_once():
     """单轮: 硬编码优先 -> 截屏识图兜底"""
-    global _last_had_click, _last_uia_pos, _last_uia_time, _uia_streak, _play_wait_start, _back_streak
+    global _last_had_click, _last_uia_pos, _last_uia_time, _uia_streak, _play_wait_start, _back_streak, _post_ad_round
+    post_ad = _post_ad_round   # 本轮的"刚关广告"状态只消费一次
+    _post_ad_round = False
     if random.random() < SKIP_PROB:
         w = random.uniform(4, 10)
         log(f"[跳过本轮] 随机暂停 {w:.1f}s")
@@ -582,9 +587,15 @@ def run_once():
             adb_swipe_down()
             time.sleep(0.6)
     elif act == "PLAY_WAIT":
-        # 播放页: 等满15秒金币到账再BACK, 不能立刻返回丢奖励
-        log(f"[播放页:{provider}] reason={reason}")
-        act = play_wait_then_back(reason)
+        if post_ad:
+            # 刚关完广告露出的播放页是残留页面, 广告15秒已经看完, 直接BACK不再等
+            log(f"[播放页:{provider}] 广告刚关闭, 判定为残留播放页, 直接BACK")
+            adb_back()
+            act = "BACK"
+        else:
+            # 真正的播放页广告: 等满15秒金币到账再BACK, 不能立刻返回丢奖励
+            log(f"[播放页:{provider}] reason={reason}")
+            act = play_wait_then_back(reason)
     elif act == "BACK":
         # 非广告页被判"非金币页": 先让导航AI判断能否从首页/我的一步步点回金币页, 不再盲目BACK退到桌面死循环
         try:
@@ -644,10 +655,11 @@ def main():
     if not Path(ADB).exists():
         log(f"!! adb 路径不存在: {ADB}")
         sys.exit(1)
-    global _last_had_click, _last_uia_pos, _last_uia_time, _uia_streak, _play_wait_start, _back_streak
+    global _last_had_click, _last_uia_pos, _last_uia_time, _uia_streak, _play_wait_start, _back_streak, _post_ad_round
     _last_had_click = False
     _play_wait_start = 0.0
     _back_streak = 0
+    _post_ad_round = False
     _last_uia_pos = None      # 上一次硬编码点击的坐标(防卡死用)
     _last_uia_time = 0.0      # 上一次硬编码点击的时间戳
     _uia_streak = 0           # 同一按钮连续命中计数(>=2 即第3次 -> 下滑换任务)
@@ -685,7 +697,7 @@ def main():
     ad_watch_start = 0.0   # 进入AD_WATCH的时间戳
     ad_close_streak = 0    # AD_CLOSE连续点X次数, >=2改BACK退出
     AD_WATCH_SECONDS = 16  # 详情页最少浏览秒数(15秒+1余量)
-    AD_WATCH_MAX_SECONDS = 45  # 30秒视频等长广告: AI说还没播完可继续等, 上限45秒(防止提前关闭丢金币)
+    AD_WATCH_MAX_SECONDS = 31  # 30秒视频等长广告: AI说还没播完可继续等, 上限31秒(防止提前关闭丢金币)
 
     def ad_step(ow, oh):
         """广告状态机单步执行, 返回状态(是否仍需继续广告流程)"""
@@ -868,6 +880,7 @@ def main():
             ad_state = AD_IDLE
             _ad_wait_streak = 0   # 重置广告WAIT计数(页面已变)
             _last_uia_pos = None; _uia_streak = 0   # 重置防卡死(页面已变)
+            _post_ad_round = True # 下一轮若看到播放页, 判定为广告残留页直接BACK
 
         # 兜底1: 连续多次WAIT说明可能卡在某个页面, 强制返回一次
         if wait_streak >= 3:
