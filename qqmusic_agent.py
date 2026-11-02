@@ -1380,16 +1380,18 @@ class QQCoinAgent:
                     self.ad_state = 3   # AD_BACK
                     return True
                 else:
-                    self._ad_wait_streak += 1
-                    log(f"[广告-等待] {action.get('reason', '')} —— 再等几秒 ({self._ad_wait_streak}/2)")
-                    if self._ad_wait_streak >= 2:
-                        log("[广告-等待超限] 连续2次无跳转入口, 强制BACK返回")
-                        adb_back()
-                        self._ad_wait_streak = 0
-                        time.sleep(random.uniform(2, 3))
-                        self.ad_state = 3
-                        return True
-                    time.sleep(random.uniform(3, 5))
+                    # 已砍掉"看不清就再问一次VLM"的分支: 实测这类"视频播放中/没有明确入口"的回答
+                    # 每次要 21-40s, 两次就 60s+, 而它什么也没做, 最后还强制BACK把页面退掉。
+                    # 现在直接当作"已在播放/无需再点" → 交给 AD_WATCH(固定点视频区 + 开始计时), 一次都不问。
+                    log(f"[广告-等待] VLM={action.get('reason', '')} —— 不再追问, 直接按已开播计时")
+                    self._ad_wait_streak = 0
+                    self.ad_watch_start = time.time()
+                    self._wait_until = time.time() + self._ad_expected_wait
+                    # VLM 说"视频播放中" → 已经在播, 别再点(点了会点进广告主页面跳外部);
+                    # 只是"看不清/加载中" → 仍让 AD_WATCH 补一次固定点视频区, 确保真的进去了。
+                    _playing = any(w in action.get("reason", "") for w in ("播放", "视频", "观看中", "倒计时"))
+                    self.ad_start_checked = _playing
+                    self.ad_state = 2   # AD_WATCH
                     return True
             except Exception as e:
                 log(f"[广告-入口异常] {e}")
