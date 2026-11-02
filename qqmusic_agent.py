@@ -330,6 +330,10 @@ def call_vlm(img_b64, mode="normal"):
         if video_top_exhausted():
             user_text = ("当前状态: 看视频领金币的次数已用完, 本轮严禁再点该板块; "
                          "优先点看视频得高额金币/金币抽奖, 没有就SWIPE/TOP。\n") + user_text
+        if _only_probe_draw:
+            user_text = ("当前状态: 四个任务只剩【抽奖赢金币】待确认。本轮只允许点【立即抽奖】(抽奖赢金币那一行); "
+                         "其他任何任务(看视频/浏览广告/领金币/摇钱树/签到/活动任务)一律不点; "
+                         "看不到立即抽奖就SWIPE或TOP。\n") + user_text
     for p in VLM_PROVIDERS:
         api_key = os.getenv(p["api_key_env"])
         if not api_key:
@@ -422,6 +426,9 @@ def video_top_exhausted():
 
 # 请求进行一次全量扫描(例如刚确认某任务已用完时)
 _need_scan = False
+
+# 定向探测: 全量扫描后如果只剩"抽奖赢金币"待确认, 正常循环只允许点立即抽奖, 禁止乱点其他任务
+_only_probe_draw = False
 
 def play_wait_then_back(reason=""):
     """播放页: 首轮开始计时, 等满PLAY_WAIT_SECONDS再BACK一次; 未满先等待. 返回PLAY_WAIT或BACK"""
@@ -619,7 +626,11 @@ def run_once():
         log("[任务状态] 点击看视频领金币后出现次数用完/明日再来, 本会话不再点该板块")
 
     if act == "CLICK":
-        if video_top_exhausted() and "看视频领金币" in reason:
+        if _only_probe_draw and not ("立即抽奖" in reason or "抽奖赢金币" in reason):
+            log(f"[定向探测] 只差抽奖赢金币确认, 跳过其他任务点击 -> 上滑 reason={reason}")
+            adb_swipe_up()
+            act = "SWIPE"
+        elif video_top_exhausted() and "看视频领金币" in reason:
             log(f"[防循环] 看视频领金币次数已用完, 跳过该板块点击 -> 上滑 reason={reason}")
             adb_swipe_up()
             act = "SWIPE"
@@ -673,6 +684,7 @@ def run_once():
         exhausted_now = ("天天抽奖" in reason and ("用完" in reason or "0/" in reason or "0次" in reason))
         if exhausted_now:
             _tian_draw_exhausted_until = time.time() + 600
+            _only_probe_draw = False   # 抽奖赢金币已确认用完, 退出定向探测
             _need_scan = True
             log("[抽奖状态] 天天抽奖次数已用完(0/10), 本会话不再点立即抽奖; 立即做一次全量扫描确认是否全部完成")
         # 非广告页被判"非金币页": 先让导航AI判断能否从首页/我的一步步点回金币页, 不再盲目BACK退到桌面死循环
@@ -729,7 +741,7 @@ def run_once():
 def full_scan():
     """全量扫描: 回到金币页顶部, 逐屏下滑到底, 检查四个指定任务是否还有可做的.
     只有确认在金币页且整页扫描都没发现可做任务时, 才返回 True(今日任务全部完成)"""
-    global _video_top_exhausted_until
+    global _video_top_exhausted_until, _only_probe_draw
     log("[全量扫描] 开始: 回到金币页顶部并逐屏扫描四个任务")
     for _ in range(6):
         adb_swipe_down()
@@ -771,6 +783,11 @@ def full_scan():
         # 整页扫描里该板块只显示已完成/明日再来, 从未出现可点按钮 -> 确认为已用完
         _video_top_exhausted_until = time.time() + 600
         seen_done.add("看视频领金币")
+    if seen_available == {"抽奖赢金币"}:
+        _only_probe_draw = True
+        log("[全量扫描] 只剩抽奖赢金币待确认, 正常循环改为定向探测(只点立即抽奖)")
+    else:
+        _only_probe_draw = False
     log(f"[全量扫描] 结果: 可做={sorted(seen_available) or '无'} | 已完成={sorted(seen_done) or '无'} | 确认金币页={coin_page_seen}")
     return coin_page_seen and not seen_available
 
@@ -781,7 +798,7 @@ def main():
     if not Path(ADB).exists():
         log(f"!! adb 路径不存在: {ADB}")
         sys.exit(1)
-    global _last_had_click, _last_uia_pos, _last_uia_time, _uia_streak, _play_wait_start, _back_streak, _post_ad_round, _tian_draw_exhausted_until, _video_top_exhausted_until, _last_click_reason, _need_scan
+    global _last_had_click, _last_uia_pos, _last_uia_time, _uia_streak, _play_wait_start, _back_streak, _post_ad_round, _tian_draw_exhausted_until, _video_top_exhausted_until, _last_click_reason, _need_scan, _only_probe_draw
     _last_had_click = False
     _play_wait_start = 0.0
     _back_streak = 0
@@ -790,6 +807,7 @@ def main():
     _video_top_exhausted_until = 0.0
     _last_click_reason = ""
     _need_scan = False
+    _only_probe_draw = False
     _last_uia_pos = None      # 上一次硬编码点击的坐标(防卡死用)
     _last_uia_time = 0.0      # 上一次硬编码点击的时间戳
     _uia_streak = 0           # 同一按钮连续命中计数(>=2 即第3次 -> 下滑换任务)
