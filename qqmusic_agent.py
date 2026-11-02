@@ -749,6 +749,7 @@ def full_scan():
     seen_available = set()
     seen_done = set()
     coin_page_seen = False
+    draw_step = None   # 抽奖赢金币"立即抽奖"出现在第几屏
     for step in range(8):
         try:
             (ow, oh), b64 = capture_and_encode()
@@ -767,6 +768,8 @@ def full_scan():
             states.append(f"{t}={st}")
             if st == "available":
                 seen_available.add(t)
+                if t == "抽奖赢金币" and draw_step is None:
+                    draw_step = step
             elif st == "done":
                 seen_done.add(t)
         log(f"[全量扫描] 第{step+1}屏: " + "  ".join(states))
@@ -786,6 +789,13 @@ def full_scan():
     if seen_available == {"抽奖赢金币"}:
         _only_probe_draw = True
         log("[全量扫描] 只剩抽奖赢金币待确认, 正常循环改为定向探测(只点立即抽奖)")
+        if draw_step is not None:
+            back = 7 - draw_step
+            if back > 0:
+                log(f"[全量扫描] 滚回抽奖赢金币所在位置(约第{draw_step+1}屏, 下滚{back}屏)")
+                for _ in range(back):
+                    adb_swipe_down()
+                    time.sleep(0.4)
     else:
         _only_probe_draw = False
     log(f"[全量扫描] 结果: 可做={sorted(seen_available) or '无'} | 已完成={sorted(seen_done) or '无'} | 确认金币页={coin_page_seen}")
