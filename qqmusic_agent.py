@@ -358,6 +358,60 @@ def tap_close(ow, oh):
     adb_tap(x, y)
 
 
+def dump_uia_xml():
+    """uiautomator dump 返回 xml 字符串; 失败返回 '' """
+    try:
+        subprocess.run([ADB, "shell", "uiautomator", "dump", "/sdcard/uidump.xml"],
+                      capture_output=True, timeout=8)
+        out = subprocess.run([ADB, "exec-out", "cat", "/sdcard/uidump.xml"],
+                            capture_output=True, timeout=8)
+        return out.stdout.decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+
+def tap_text_node(keyword, exclude=(), exact=False, bias_right=False):
+    """uiautomator dump 中找含 keyword 文本的节点并点击其像素中心; 命中返回True.
+    exact=True 时只匹配 text/desc 完全等于 keyword (用于'我的'等易误匹配的短词).
+    bias_right=True 时点击点偏向节点右侧(用于'退出'文字在提示栏右端的场景).
+    多个候选时优先最窄(最具体)的节点, 避免点到父容器."""
+    xml = dump_uia_xml()
+    if "<node" not in xml:
+        return False
+    candidates = []
+    for m in re.finditer(r'<node[^>]*>', xml):
+        node = m.group(0)
+        t = re.search(r'text="([^"]*)"', node)
+        d = re.search(r'content-desc="([^"]*)"', node)
+        txt = (t.group(1) if t else "") or (d.group(1) if d else "")
+        if not txt:
+            continue
+        if exact:
+            if txt != keyword:
+                continue
+        else:
+            if keyword not in txt:
+                continue
+        if any(ex in txt for ex in exclude):
+            continue
+        b = re.search(r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"', node)
+        if not b:
+            continue
+        x1, y1, x2, y2 = (int(b.group(i)) for i in range(1, 5))
+        if x2 - x1 < 5 or y2 - y1 < 5:
+            continue
+        candidates.append((x2 - x1, x1, x2, y1, y2, txt))
+    if not candidates:
+        return False
+    candidates.sort(key=lambda c: c[0])  # 优先最窄(最具体)的节点
+    _, x1, x2, y1, y2, txt = candidates[0]
+    cx = x1 + (x2 - x1) * 4 // 5 if bias_right else (x1 + x2) // 2
+    cy = (y1 + y2) // 2
+    log(f"[点文字] 命中文本={txt[:24]} 坐标({cx},{cy})")
+    adb_tap(cx, cy)
+    return True
+
+
 def save_sample(round_no, reason):
     """卡住时被动采样: 3张间隔截图 + 上下文(日志尾部/焦点/状态) 到 ad_samples/<ts>_r<n>/"""
     try:
@@ -810,8 +864,14 @@ class QQCoinAgent:
             if act == "BACK":
                 self._back_streak += 1
                 if self._back_streak >= 2:
-                    log(f"[导航失败] 连续{self._back_streak}次无法回到金币页, 暂停30秒 —— 请手动回到金币狂欢节页面")
-                    time.sleep(30)
+                    log(f"[导航失败] 连续{self._back_streak}次无法回到金币页, 尝试自动导航进入金币中心")
+                    self.goto_coin_center()
+                    if self._on_coin_center():
+                        log("[导航] 已自动回到金币中心, 继续")
+                    else:
+                        log("[导航] 自动导航未成功, 暂停10秒后重试")
+                        time.sleep(10)
+                    self._back_streak = 0
                 else:
                     log(f"[返回:{provider}] reason={reason}")
                     adb_back()
@@ -901,6 +961,68 @@ class QQCoinAgent:
             self._probe_draw_attempts = 0
         log(f"[全量扫描] 结果: 可做={sorted(seen_available) or '无'} | 已完成={sorted(seen_done) or '无'} | 确认金币页={coin_page_seen}")
         return coin_page_seen and not seen_available
+
+    # ---------- 自动导航到金币中心 ----------
+    def _on_coin_center(self):
+        """uiautomator 粗判当前是否在金币中心页(看视频领金币/天天抽奖等存在)"""
+        xml = dump_uia_xml()
+        if not xml:
+            return False
+        for kw in ("看视频领金币", "金币狂欢节", "天天抽奖", "抽奖赢金币", "金币中心"):
+            if kw in xml:
+                return True
+        return False
+
+    def _tap_any(self, keywords, exclude=(), exact=False, bias_right=False):
+        for kw in keywords:
+            if tap_text_node(kw, exclude=exclude, exact=exact, bias_right=bias_right):
+                return True
+        return False
+
+    def goto_coin_center(self):
+        """从任意QQ音乐页面(首页/我的/领现金页)自动导航到金币中心.
+        链路: 直接入口(看广告赚金币) -> 否则 我的 -> 领现金 -> 金币中心 ; 末用VLM兜底.
+        优先uiautomator文本点击(不耗API). 返回是否成功进入金币中心."""
+        log("[导航] 尝试自动进入金币中心(我的-领现金-金币中心)...")
+        if self._on_coin_center():
+            log("[导航] 已在金币中心")
+            return True
+        # 步骤0: 直接入口(首页右侧浮窗 / 任意页的'看广告赚金币')
+        if self._tap_any(("看广告赚金币", "金币中心", "做任务赚金币")):
+            time.sleep(2.5)
+            if self._on_coin_center():
+                return True
+        # 步骤1: 底部'我的' tab (exact 避免匹配'我的音乐'等子项)
+        if self._tap_any(("我的",), exact=True,
+                         exclude=("我的收藏", "我的音乐", "我的听歌", "我的关注",
+                                  "我的订单", "我的钱包", "我的客服", "我的动态")):
+            time.sleep(1.5)
+            # 步骤2: '领现金'
+            if self._tap_any(("领现金",)):
+                time.sleep(2.0)
+                # 步骤3: 领现金页内的金币中心入口
+                if self._tap_any(("看广告赚金币", "金币中心", "做任务赚金币")):
+                    time.sleep(2.5)
+                    if self._on_coin_center():
+                        return True
+        # 兜底: VLM 导航
+        try:
+            (ow, oh), b64 = capture_and_encode()
+            nav = self.call_vlm(b64, mode="nav")
+            nact = nav.get("action", "BACK")
+            log(f"[导航兜底:{nav.get('_provider', '?')}] {nact} reason={nav.get('reason', '')}")
+            if nact == "CLICK":
+                try:
+                    rx = float(nav.get("x", 500)); ry = float(nav.get("y", 500))
+                except (TypeError, ValueError):
+                    rx, ry = 500, 500
+                x = int(rx / 1000 * ow) + random.randint(-OFFSET, OFFSET)
+                y = int(ry / 1000 * oh) + random.randint(-OFFSET, OFFSET)
+                adb_tap(x, y)
+                time.sleep(2.5)
+        except Exception as e:
+            log(f"[导航兜底失败] {str(e)[:40]}")
+        return self._on_coin_center()
 
     # ---------- 广告状态机单步 ----------
     def ad_step(self, ow, oh):
@@ -1005,27 +1127,33 @@ class QQCoinAgent:
                 self.ad_state = 0
             else:
                 if self.ad_close_streak == 0:
-                    try:
-                        (ow_c, oh_c), b64_c = capture_and_encode()
-                        close_action = self.call_vlm(b64_c, mode="close")
-                        if close_action.get("action") == "CLICK":
-                            try:
-                                rx = float(close_action.get("x", 500))
-                                ry = float(close_action.get("y", 500))
-                            except (TypeError, ValueError):
-                                rx, ry = 500, 500
-                            x = int(rx / 1000 * ow_c) + random.randint(-OFFSET, OFFSET)
-                            y = int(ry / 1000 * oh_c) + random.randint(-OFFSET, OFFSET)
-                            log(f"[广告-关闭按钮AI定位] 坐标({x},{y}) reason={close_action.get('reason', '')}")
-                            adb_tap(x, y)
-                        else:
-                            log(f"[广告-关闭AI未给出按钮] 直接BACK退出(H5页无原生X)")
+                    # 优先: uiautomator 找左上角'退出'文字(用户确认可直接退出广告), 不耗API
+                    if tap_text_node("退出", exclude=("退出登录", "退出账号"), bias_right=True):
+                        log("[广告-点退出] 命中左上角'退出'文字, 尝试关闭广告")
+                        self.ad_close_streak += 1
+                        time.sleep(random.uniform(2, 4))
+                    else:
+                        try:
+                            (ow_c, oh_c), b64_c = capture_and_encode()
+                            close_action = self.call_vlm(b64_c, mode="close")
+                            if close_action.get("action") == "CLICK":
+                                try:
+                                    rx = float(close_action.get("x", 500))
+                                    ry = float(close_action.get("y", 500))
+                                except (TypeError, ValueError):
+                                    rx, ry = 500, 500
+                                x = int(rx / 1000 * ow_c) + random.randint(-OFFSET, OFFSET)
+                                y = int(ry / 1000 * oh_c) + random.randint(-OFFSET, OFFSET)
+                                log(f"[广告-关闭按钮AI定位] 坐标({x},{y}) reason={close_action.get('reason', '')}")
+                                adb_tap(x, y)
+                            else:
+                                log(f"[广告-关闭AI未给出按钮] 直接BACK退出(H5页无原生X)")
+                                adb_back()
+                        except Exception as e:
+                            log(f"[广告-关闭AI失败] 直接BACK退出 ({str(e)[:30]})")
                             adb_back()
-                    except Exception as e:
-                        log(f"[广告-关闭AI失败] 直接BACK退出 ({str(e)[:30]})")
-                        adb_back()
-                    self.ad_close_streak += 1
-                    time.sleep(random.uniform(3, 5))
+                        self.ad_close_streak += 1
+                        time.sleep(random.uniform(3, 5))
                 elif self.ad_close_streak == 1:
                     log("[广告-仍在广告页] BACK后再试固定右上角X")
                     tap_close(ow, oh)
@@ -1096,7 +1224,12 @@ class QQCoinAgent:
         swipe_streak = 0
         no_click = 0
 
-        log("[启动] 直接进入刷任务循环(终局验证扫描在判定全部完成时进行)")
+        log("[启动] 自动进入金币中心(支持从首页开始)...")
+        self.goto_coin_center()
+        if self._on_coin_center():
+            log("[启动] 已就位金币中心, 开始刷任务")
+        else:
+            log("[启动] 未自动进入金币中心, 直接开始(若已在金币页附近仍可工作)")
 
         while n < rounds:
             n += 1
@@ -1217,15 +1350,24 @@ class QQCoinAgent:
         self._finish(rounds)
 
     def _return_to_qqmusic(self, max_back=12):
-        """轮数到上限/收尾时, 主动把焦点拉回QQ音乐(金币页), 避免停在第三方App/广告页。
-        广告页/H5常拦截BACK键, 故除BACK外还试固定右上角X关闭; 仍失败则force-stop当前前台包并重拉QQ音乐。"""
-        log("[收尾] 主动兜底回到QQ音乐...")
+        """轮数到上限/收尾时, 主动把焦点拉回QQ音乐金币中心, 避免停在第三方App/广告页。
+        广告页/H5常拦截BACK键, 故先试左上角'退出'文字(用户确认可直接退出), 再试固定右上角X, 再BACK;
+        仍失败则force-stop当前前台包并重拉QQ音乐, 重拉后自动导航进入金币中心。"""
+        log("[收尾] 主动兜底回到QQ音乐(金币中心)...")
         for _ in range(max_back):
             if is_in_qqmusic() and not is_ad_activity():
-                log("[收尾] 已回到QQ音乐任务页")
-                return
-            # 广告页: 先试固定右上角X关闭, 再BACK
+                # 可能停在首页/其他子页, 确保进入金币中心
+                if not self._on_coin_center():
+                    self.goto_coin_center()
+                if self._on_coin_center():
+                    log("[收尾] 已回到QQ音乐金币中心")
+                    return
+            # 广告页: 先试左上角'退出'文字, 再试固定右上角X关闭, 再BACK
             if is_ad_activity():
+                if tap_text_node("退出", exclude=("退出登录", "退出账号"), bias_right=True):
+                    log("[收尾] 已点'退出'尝试关闭广告")
+                    time.sleep(1.5)
+                    continue
                 try:
                     screencap(SCREEN_PATH)
                     ow, oh = Image.open(SCREEN_PATH).size
@@ -1235,7 +1377,7 @@ class QQCoinAgent:
                 time.sleep(1.0)
             adb_back()
             time.sleep(1.0)
-        # 收尾仍未回到QQ音乐任务页 -> 强制结束当前前台包 + 重拉QQ音乐(可确定性逃出BACK陷阱)
+        # 收尾仍未回到目标 -> 强制结束当前前台包 + 重拉QQ音乐(可确定性逃出BACK陷阱)
         pkg = current_focus_package()
         if is_ad_activity() or (pkg and pkg != "com.tencent.qqmusic"):
             log(f"[收尾] 常规退出失败(当前包={pkg}), force-stop 并重拉QQ音乐")
@@ -1257,11 +1399,13 @@ class QQCoinAgent:
             except Exception as e:
                 log(f"[收尾] monkey失败: {str(e)[:40]}")
             time.sleep(3)
-        # 最终状态日志
-        if is_in_qqmusic():
-            log("[收尾] 已回到QQ音乐(可能为首页, 非金币中心, 需手动进金币中心)")
+        # 重拉后确保进入金币中心
+        if not self._on_coin_center():
+            self.goto_coin_center()
+        if self._on_coin_center():
+            log("[收尾] 已回到QQ音乐金币中心")
         else:
-            log("[收尾] 警告: 仍未回到QQ音乐, 请手动处理")
+            log("[收尾] 警告: 仍未进入金币中心, 请手动处理")
 
     def _finish(self, rounds):
         log(f"[统计] 本轮共调用视觉模型 {self._vlm_calls} 次 (轮数上限={rounds})")
