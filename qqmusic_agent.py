@@ -180,8 +180,11 @@ SCAN_PROMPT = (
     "你是金币任务全量扫描Agent。判断当前截图是否为【金币狂欢节/金币中心】任务页, 并判断四个指定任务在本屏的状态。"
     "只输出一个JSON对象, 不要多余文字。\n"
     "四个任务: 看视频领金币 / 看视频得高额金币 / 抽奖赢金币 / 金币抽奖(看广告领好礼、金币抽奖格子)。\n"
-    "每个任务状态: available=按钮可点且未完成(如看视频/领金币/立即抽奖/去抽奖); "
-    "done=显示已完成/已领完/明日再来/次数0/今日奖品已派发完毕; absent=本屏没有这个任务。\n"
+    "状态定义: available=本屏清晰出现该任务的明确可点按钮(看视频板块内的【看视频/领金币/去完成】、"
+    "抽奖赢金币行的【立即抽奖】、金币抽奖格子的【去抽奖/立即抽奖】), 且按钮不是灰色/未显示已完成; "
+    "done=显示已完成/已领完/明日再来/次数0/今日奖品已派发完毕; absent=本屏没有该任务的可点按钮。\n"
+    "重要: 只看到板块标题、奖金额度卡片、进度条、奖品图标、右下角悬浮【领金币】、"
+    "每日任务里定时领金币/红包雨等行右侧的【领金币】, 都不算available, 一律记absent。\n"
     "输出格式: {\"is_coin_page\":true或false, \"看视频领金币\":\"available|done|absent\", "
     "\"看视频得高额金币\":\"...\", \"抽奖赢金币\":\"...\", \"金币抽奖\":\"...\"}\n"
     "只输出JSON。"
@@ -316,12 +319,17 @@ def call_vlm(img_b64, mode="normal"):
         user_text = "扫描这张截图，按规则输出四个任务状态JSON。"
         if tian_draw_exhausted():
             user_text += " (抽奖赢金币本会话已确认0/10, 直接按done处理)"
+        if video_top_exhausted():
+            user_text += " (看视频领金币本会话已确认次数用完, 直接按done处理)"
     elif mode == "normal":
         # 只给动作序列(SWIPE/CLICK/TOP...), 不给任务名: 防止模型看到"点过看视频"就判定任务已完成
         user_text = f"最近动作历史(旧→新): {action_history_text(with_reason=False)}\n" + user_text
         if tian_draw_exhausted():
             user_text = ("当前状态: 天天抽奖/抽奖赢金币的看广告次数已用完(0/10), "
                          "本轮严禁再点【立即抽奖】; 优先点看视频领金币/看视频得高额金币, 没有就SWIPE/TOP。\n") + user_text
+        if video_top_exhausted():
+            user_text = ("当前状态: 看视频领金币的次数已用完, 本轮严禁再点该板块; "
+                         "优先点看视频得高额金币/金币抽奖, 没有就SWIPE/TOP。\n") + user_text
     for p in VLM_PROVIDERS:
         api_key = os.getenv(p["api_key_env"])
         if not api_key:
@@ -404,6 +412,16 @@ _tian_draw_exhausted_until = 0.0
 
 def tian_draw_exhausted():
     return time.time() < _tian_draw_exhausted_until
+
+# 看视频领金币次数已用完标记: 点一次看到"次数用完/明日再来"后确认, 扫描时按done处理
+_video_top_exhausted_until = 0.0
+_last_click_reason = ""
+
+def video_top_exhausted():
+    return time.time() < _video_top_exhausted_until
+
+# 请求进行一次全量扫描(例如刚确认某任务已用完时)
+_need_scan = False
 
 def play_wait_then_back(reason=""):
     """播放页: 首轮开始计时, 等满PLAY_WAIT_SECONDS再BACK一次; 未满先等待. 返回PLAY_WAIT或BACK"""
@@ -525,9 +543,11 @@ def _match_task_keyword(txt):
 
 def run_once():
     """单轮: 硬编码优先 -> 截屏识图兜底"""
-    global _last_had_click, _last_uia_pos, _last_uia_time, _uia_streak, _play_wait_start, _back_streak, _post_ad_round, _tian_draw_exhausted_until
+    global _last_had_click, _last_uia_pos, _last_uia_time, _uia_streak, _play_wait_start, _back_streak, _post_ad_round, _tian_draw_exhausted_until, _video_top_exhausted_until, _last_click_reason, _need_scan
     post_ad = _post_ad_round   # 本轮的"刚关广告"状态只消费一次
     _post_ad_round = False
+    last_click = _last_click_reason   # 上一轮点的是什么(只用一次)
+    _last_click_reason = ""
     if random.random() < SKIP_PROB:
         w = random.uniform(4, 10)
         log(f"[跳过本轮] 随机暂停 {w:.1f}s")
@@ -587,8 +607,23 @@ def run_once():
     provider = action.get("_provider", "?")
     reason = action.get("reason", "")
 
+    # 看视频领金币次数用完确认: ①本轮页面直接说明; ②上一轮点的是看视频领金币, 本轮出现"次数用完/明日再来"
+    exhaustion_words = ("次数已用完", "次数0", "0次", "明日再来", "已领完", "已完成", "派发完毕")
+    if "看视频领金币" in reason and any(k in reason for k in exhaustion_words):
+        _video_top_exhausted_until = time.time() + 600
+        _need_scan = True
+        log("[任务状态] 看视频领金币次数已用完/已完成, 本会话不再点该板块")
+    elif "看视频领金币" in last_click and any(k in reason for k in exhaustion_words):
+        _video_top_exhausted_until = time.time() + 600
+        _need_scan = True
+        log("[任务状态] 点击看视频领金币后出现次数用完/明日再来, 本会话不再点该板块")
+
     if act == "CLICK":
-        if tian_draw_exhausted() and ("立即抽奖" in reason or "抽奖赢金币" in reason):
+        if video_top_exhausted() and "看视频领金币" in reason:
+            log(f"[防循环] 看视频领金币次数已用完, 跳过该板块点击 -> 上滑 reason={reason}")
+            adb_swipe_up()
+            act = "SWIPE"
+        elif tian_draw_exhausted() and ("立即抽奖" in reason or "抽奖赢金币" in reason):
             # 天天抽奖0/10后模型仍想点"立即抽奖": 代码强制拦截, 否则会在金币页↔抽奖页来回死循环
             log(f"[防循环] 天天抽奖次数已用完, 跳过立即抽奖 -> 上滑找看视频 reason={reason}")
             adb_swipe_up()
@@ -610,6 +645,8 @@ def run_once():
                 adb_tap(x, y)
             except Exception as e:
                 log(f"[点击失败] {e}")
+            # 记录本轮点了什么, 供下一轮判断"次数用完"提示
+            _last_click_reason = reason
             # 点击即视为广告流程有进展, 重置卡死计数
             _last_had_click = True
     elif act == "SWIPE":
@@ -636,7 +673,8 @@ def run_once():
         exhausted_now = ("天天抽奖" in reason and ("用完" in reason or "0/" in reason or "0次" in reason))
         if exhausted_now:
             _tian_draw_exhausted_until = time.time() + 600
-            log("[抽奖状态] 天天抽奖次数已用完(0/10), 本会话不再点立即抽奖(保留当前页面位置, 继续处理下方任务)")
+            _need_scan = True
+            log("[抽奖状态] 天天抽奖次数已用完(0/10), 本会话不再点立即抽奖; 立即做一次全量扫描确认是否全部完成")
         # 非广告页被判"非金币页": 先让导航AI判断能否从首页/我的一步步点回金币页, 不再盲目BACK退到桌面死循环
         try:
             nav = call_vlm(b64, mode="nav")
@@ -691,6 +729,7 @@ def run_once():
 def full_scan():
     """全量扫描: 回到金币页顶部, 逐屏下滑到底, 检查四个指定任务是否还有可做的.
     只有确认在金币页且整页扫描都没发现可做任务时, 才返回 True(今日任务全部完成)"""
+    global _video_top_exhausted_until
     log("[全量扫描] 开始: 回到金币页顶部并逐屏扫描四个任务")
     for _ in range(6):
         adb_swipe_down()
@@ -710,6 +749,9 @@ def full_scan():
         states = []
         for t in SCAN_TASKS:
             st = str(result.get(t, "absent")).strip().lower()
+            # 看视频领金币板块只在页面顶部的前4屏; 底部"领金币"/听热歌/签到/金币抽奖格子不算它
+            if t == "看视频领金币" and step >= 4:
+                st = "absent"
             states.append(f"{t}={st}")
             if st == "available":
                 seen_available.add(t)
@@ -722,6 +764,13 @@ def full_scan():
     if tian_draw_exhausted():
         seen_available.discard("抽奖赢金币")
         seen_done.add("抽奖赢金币")
+    if video_top_exhausted():
+        seen_available.discard("看视频领金币")
+        seen_done.add("看视频领金币")
+    elif "看视频领金币" in seen_done and "看视频领金币" not in seen_available:
+        # 整页扫描里该板块只显示已完成/明日再来, 从未出现可点按钮 -> 确认为已用完
+        _video_top_exhausted_until = time.time() + 600
+        seen_done.add("看视频领金币")
     log(f"[全量扫描] 结果: 可做={sorted(seen_available) or '无'} | 已完成={sorted(seen_done) or '无'} | 确认金币页={coin_page_seen}")
     return coin_page_seen and not seen_available
 
@@ -732,12 +781,15 @@ def main():
     if not Path(ADB).exists():
         log(f"!! adb 路径不存在: {ADB}")
         sys.exit(1)
-    global _last_had_click, _last_uia_pos, _last_uia_time, _uia_streak, _play_wait_start, _back_streak, _post_ad_round, _tian_draw_exhausted_until
+    global _last_had_click, _last_uia_pos, _last_uia_time, _uia_streak, _play_wait_start, _back_streak, _post_ad_round, _tian_draw_exhausted_until, _video_top_exhausted_until, _last_click_reason, _need_scan
     _last_had_click = False
     _play_wait_start = 0.0
     _back_streak = 0
     _post_ad_round = False
     _tian_draw_exhausted_until = 0.0
+    _video_top_exhausted_until = 0.0
+    _last_click_reason = ""
+    _need_scan = False
     _last_uia_pos = None      # 上一次硬编码点击的坐标(防卡死用)
     _last_uia_time = 0.0      # 上一次硬编码点击的时间戳
     _uia_streak = 0           # 同一按钮连续命中计数(>=2 即第3次 -> 下滑换任务)
@@ -994,6 +1046,16 @@ def main():
         if act == "SWIPE":
             swipe_streak += 1
         else:
+            swipe_streak = 0
+
+        # 刚确认某个任务已用完 -> 立即全量扫描一次; 四个任务都没有可做的就退出
+        if _need_scan and not is_ad_activity():
+            _need_scan = False
+            if full_scan():
+                log("[全量扫描] 今日四个任务全部完成, 退出")
+                return
+            no_click = 0
+            wait_streak = 0
             swipe_streak = 0
 
         # 连续多轮没点到任何任务 -> 全量扫描一次; 四个任务都没有可做的就退出
