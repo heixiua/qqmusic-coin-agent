@@ -18,3 +18,8 @@ __pycache__/
 *.pyo
 .venv/
 venv/
+
+# ===== 本地环境/备份(不提交) =====
+.vscode/
+.workbuddy/
+qqmusic_agent.bak_*.py

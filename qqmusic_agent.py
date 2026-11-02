@@ -10,12 +10,17 @@ QQ音乐金币广告 视觉Agent自动点击器 (Agnes 免费多模态版)
   3. .env 里有 AGNES_API_KEY(你已有)
 
 运行:
-  python qqmusic_agent.py
+  python qqmusic_agent.py [轮数]      # 例: python qqmusic_agent.py 20
 
 反风控提示(务必看):
   本脚本仅用于你自己低频少量使用。QQ音乐用户协议禁止脚本自动化刷金币,
   存在账号被风控/金币清零/QQ连带限制的风险。已内置随机等待+坐标偏移+随机跳过,
   但仍不建议长时间挂机, 一旦发现金币不增加请立即停止。
+
+代码结构(2026-11-02 重构):
+  配置/常量/prompts 留在模块级; 所有"运行期状态"收进 QQCoinAgent 实例属性,
+  消除原脚本里十几个 global 声明。核心方法: run_once(单轮) / ad_step(广告状态机单步)
+  / full_scan(终局验证扫描) / run(主循环)。
 """
 import os
 import sys
@@ -26,6 +31,7 @@ import base64
 import io
 import re
 import subprocess
+import threading
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -43,15 +49,18 @@ load_dotenv(dotenv_path=_LLM_CLIENT_DIR / ".env")
 AGNES_BASE_URL = "https://apihub.agnes-ai.com/v1"
 AGNES_MODEL = os.getenv("AGNES_MODEL", "agnes-3.0-flash")
 
-MAX_ROUNDS = 200          # 单次运行最多轮数
+MAX_ROUNDS = 20           # 单次运行最多轮数(用户要求改20, 不跑150那么多)
 SHOT_INTERVAL = 1.0       # 轮间隔(秒); AI调用本身已耗时10-20s, 无需再等太多
 WAIT_MIN, WAIT_MAX = 1.0, 2.0    # 每次动作后随机等待(反风控, AI调用延迟已提供间隔)
+PLAY_WAIT_SECONDS = 15      # 播放页最少听满秒数(金币才到账)
+AD_WATCH_SECONDS = 16       # 广告详情页最少浏览秒数(15秒+1余量)
+AD_WATCH_MAX_SECONDS = 31   # 30秒视频等长广告: AI说还没播完可继续等, 上限31秒(防止提前关闭丢金币)
 OFFSET = 12               # 点击坐标随机偏移(千分比坐标下偏移1.2%)
 SKIP_PROB = 0.08          # 随机跳过本轮概率(反风控)
 RESIZE_WIDTH = 800        # 送模型的图片宽度
 SCREEN_PATH = "screen_tmp.png"
 
-# ===== 版本2: 金币页硬编码优先(减少AI调用) =====
+# ===== 金币页硬编码优先(减少AI调用) =====
 # 用户指定只刷: ①看视频领金币/看视频得高额金币(按钮文本=看视频) ②抽奖赢金币(立即抽奖) ③金币抽奖页(看广告抽奖)
 # ④广告闭环弹窗(浏览5秒/观看下一条/观看完成)——这些是看完广告后连刷入口, 必须保留
 # 其余任务(定时领金币/翻卡/红包雨/听歌/分享/收藏/关注/下载等)一律不点, 用户自己刷
@@ -73,7 +82,6 @@ UA_EXCLUDE_KEYWORDS = [
     "每日可以获得", "看视频机会",                     # 金币页提示文字"每日可以获得20次看视频机会..."不是按钮, 排除误命中
     "领金币",                                     # 金币页活动区任务行右侧的"领金币"按钮一律不点(只有看视频领金币板块内的AI视觉区分)
 ]
-# ==========================================
 
 SYSTEM_PROMPT = (
     "你是QQ音乐赚金币页面自动操作Agent。分析截图, 只输出一个JSON对象, 不要任何多余文字和markdown。\n"
@@ -131,6 +139,8 @@ SYSTEM_PROMPT = (
 AD_ENTRY_PROMPT = (
     "你是广告页按钮定位Agent。分析截图, 只输出一个JSON对象。\n"
     "规则:\n"
+    "0. 优先留在应用内: 只要页面有 1b【立即浏览/浏览15秒/开始浏览】或 1c【点击商品卡】这类不会跳出QQ音乐的入口, 就优先点它们; "
+    "只有在完全没有这类入口时, 才点 1 的【了解详情/进入详情页或第三方应用】(会跳浏览器/应用商店, 尽量少触发, 跳出去既拿不到金币又易卡死)。\n"
     "1. 页面有【了解详情/点击查看/立即咨询/进入详情页或第三方应用】按钮时: {\"action\":\"CLICK\",\"x\":X,\"y\":X,\"reason\":\"点跳转按钮启动计时\"}, "
     "x,y为该按钮中心相对坐标(0~1000)。注意: 页面可能同时有多个入口(如顶部横幅+底部按钮), 点最明显的那个。"
     "【立即咨询】也是合法的跳转按钮(进入保险H5/咨询详情页, 计时照常走, 看完BACK能退出), 不要因为含'咨询'就拒绝点它。\n"
@@ -190,88 +200,27 @@ SCAN_PROMPT = (
     "只输出JSON。"
 )
 
-def log(msg):
-    line = f"[{time.strftime('%H:%M:%S')}] {msg}"
-    print(line, flush=True)
-    # 同时落盘 agent_run.log (供 evolver 采样分析, gitignore)
-    try:
-        with open("agent_run.log", "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-    except Exception:
-        pass
+# 右上角关闭X的位置(相对坐标0~1000, 用户截图标定约925,107)
+CLOSE_X_REL, CLOSE_Y_REL = 925, 107
 
-# ===== 动作历史(给模型的短期记忆, 防止原地重复) =====
-_recent_actions = []   # [(action, reason)]
+# 主线程心跳 + watchdog
+WATCHDOG_TIMEOUT = 90     # 超过90s无任何进展判定为疑似卡死
 
-def remember_action(action, reason=""):
-    """记录本轮真实动作, 最多保留10条, 作为下一轮AI判断是否卡住的依据"""
-    _recent_actions.append((str(action), str(reason)[:20]))
-    if len(_recent_actions) > 10:
-        del _recent_actions[:-10]
+# 卡住样本采样目录
+SAMPLE_DIR = Path("ad_samples")
 
-def action_history_text(n=6, with_reason=True):
-    """动作历史文本. 给模型看时只给动作序列(不给任务名), 避免模型误判"点过=已完成" """
-    if not _recent_actions:
-        return "（无）"
-    items = _recent_actions[-n:]
-    if with_reason:
-        return " -> ".join(f"{a}({r})" if r else a for a, r in items)
-    return " -> ".join(a for a, _ in items)
-
-# ===== 卡住样本采样(保留给 evolver 使用, 不再是AI自救触发) =====
-SAMPLE_DIR = Path("ad_samples")   # 卡住样本存放目录
-
-def save_sample(round_no, reason):
-    """卡住时被动采样: 3张间隔截图 + 上下文(日志尾部/焦点/状态) 到 ad_samples/<ts>_r<n>/"""
-    try:
-        ts = time.strftime("%Y%m%d_%H%M%S")
-        d = SAMPLE_DIR / f"{ts}_r{round_no}"
-        d.mkdir(parents=True, exist_ok=True)
-        for i in range(3):
-            screencap(SCREEN_PATH)
-            with open(d / f"shot_{i}.png", "wb") as f:
-                f.write(Path(SCREEN_PATH).read_bytes())
-            if i < 2:
-                time.sleep(2)
-        # 上下文: 焦点 + 最近日志尾部
-        focus = current_focus_window()
-        ctx = [f"round={round_no}  time={time.strftime('%H:%M:%S')}  reason={reason}",
-               f"focus={focus}", ""]
-        try:
-            with open("agent_run.log", "r", encoding="utf-8") as f:
-                tail = f.readlines()[-40:]
-            ctx.append("===== 最近日志 =====")
-            ctx.extend(l.rstrip("\n") for l in tail)
-        except Exception:
-            pass
-        (d / "context.txt").write_text("\n".join(ctx), encoding="utf-8")
-        log(f"[watchdog] 已采样卡住样本: {d}")
-    except Exception as e:
-        log(f"[watchdog] 采样失败: {str(e)[:60]}")
-
-def screencap(path):
-    """adb截屏保存到文件"""
-    with open(path, "wb") as f:
-        subprocess.run([ADB, "exec-out", "screencap", "-p"], stdout=f, check=True)
-
-def capture_and_encode():
-    """截屏 -> 压缩 -> 返回(原图尺寸, base64)"""
-    screencap(SCREEN_PATH)
-    img = Image.open(SCREEN_PATH).convert("RGB")
-    orig_w, orig_h = img.size
-    scale = RESIZE_WIDTH / orig_w
-    img2 = img.resize((RESIZE_WIDTH, int(orig_h * scale)), Image.LANCZOS)
-    buf = io.BytesIO()
-    img2.save(buf, format="PNG")
-    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-    return (orig_w, orig_h), b64
-
-# 多模态供应商降级链 (全部免费/已有key): Agnes -> 智谱GLM-4V-Flash -> 硅基流动DeepSeek-OCR(纯文字兜底)
+# 多模态供应商降级链: Agnes主号 -> Agnes备用号(同学) -> 智谱GLM-4V -> 硅基DeepSeek-OCR(纯文字兜底)
 VLM_PROVIDERS = [
     {
-        "name": "Agnes",
+        "name": "Agnes(主号)",
         "base_url": "https://apihub.agnes-ai.com/v1",
         "api_key_env": "AGNES_API_KEY",
+        "model": os.getenv("AGNES_MODEL", "agnes-3.0-flash"),
+    },
+    {
+        "name": "Agnes(备用号-同学)",
+        "base_url": "https://apihub.agnes-ai.com/v1",
+        "api_key_env": "AGNES_API_KEY2",
         "model": os.getenv("AGNES_MODEL", "agnes-3.0-flash"),
     },
     {
@@ -289,166 +238,55 @@ VLM_PROVIDERS = [
     },
 ]
 
-# OCR 兜底: 识别文字后按关键词决定动作(无坐标, 不做CLICK)
-def ocr_to_action(text: str) -> dict:
-    t = text
-    # 商品/购物/购买/第三方App特征 → 返回(误跳第三方)
-    if any(k in t for k in ["商品", "购物", "购买", "加入购物车", "立即购买", "店铺", "客服",
-                            "降价通知", "京东", "淘宝", "拼多多", "领券", "下单", "满减", "自营"]):
-        return {"action": "BACK", "reason": f"OCR识别到商品页/第三方App关键词: {t[:40]}"}
-    # 广告播放/剩余秒 → 等待
-    if any(k in t for k in ["剩余", "秒", "广告播放", "倒计时", "播放中"]):
-        return {"action": "WAIT", "reason": f"OCR识别到广告播放关键词: {t[:40]}"}
-    # 活动任务/打开/去/下载 → 下滑(跳第三方App任务)
-    if any(k in t for k in ["活动任务", "打开", "去完成", "去分享", "去关注", "下载", "安装"]):
-        return {"action": "SWIPE", "reason": f"OCR识别到活动任务区关键词: {t[:40]}"}
-    # 拿不准 → 下滑看看
-    return {"action": "SWIPE", "reason": f"OCR无明确关键词, 下滑: {t[:40]}"}
 
-def call_vlm(img_b64, mode="normal"):
-    """按降级链调用多模态视觉模型, 返回动作dict; 全部失败返回WAIT
-    mode: "normal"=金币页常规判断, "ad"=广告页按钮定位"""
-    last_err = None
-    sys_prompt = (AD_ENTRY_PROMPT if mode == "ad" else
-                  AD_CLOSE_PROMPT if mode == "close" else
-                  NAV_PROMPT if mode == "nav" else
-                  SCAN_PROMPT if mode == "scan" else SYSTEM_PROMPT)
-    # 金币页常规判断时附上最近动作历史(纯文本短期记忆), 让模型能看到自己在重复什么
-    user_text = "分析这张手机截图，按规则输出JSON。"
-    if mode == "scan":
-        user_text = "扫描这张截图，按规则输出四个任务状态JSON。"
-        if tian_draw_exhausted():
-            user_text += " (抽奖赢金币本会话已确认0/10, 直接按done处理)"
-        if video_top_exhausted():
-            user_text += " (看视频领金币本会话已确认次数用完, 直接按done处理)"
-    elif mode == "normal":
-        # 只给动作序列(SWIPE/CLICK/TOP...), 不给任务名: 防止模型看到"点过看视频"就判定任务已完成
-        user_text = f"最近动作历史(旧→新): {action_history_text(with_reason=False)}\n" + user_text
-        if tian_draw_exhausted():
-            user_text = ("当前状态: 天天抽奖/抽奖赢金币的看广告次数已用完(0/10), "
-                         "本轮严禁再点【立即抽奖】; 优先点看视频领金币/看视频得高额金币, 没有就SWIPE/TOP。\n") + user_text
-        if video_top_exhausted():
-            user_text = ("当前状态: 看视频领金币的次数已用完, 本轮严禁再点该板块; "
-                         "优先点看视频得高额金币/金币抽奖, 没有就SWIPE/TOP。\n") + user_text
-        if _only_probe_draw:
-            user_text = ("当前状态: 四个任务只剩【抽奖赢金币】待确认。本轮只允许点【立即抽奖】(抽奖赢金币那一行); "
-                         "其他任何任务(看视频/浏览广告/领金币/摇钱树/签到/活动任务)一律不点; "
-                         "看不到立即抽奖就SWIPE或TOP。\n") + user_text
-    for p in VLM_PROVIDERS:
-        api_key = os.getenv(p["api_key_env"])
-        if not api_key:
-            continue
-        try:
-            client = OpenAI(base_url=p["base_url"], api_key=api_key, timeout=60)
-            # 纯OCR模型: 让它输出全部文字, 再按关键词规则判断
-            if p.get("is_ocr"):
-                resp = client.chat.completions.create(
-                    model=p["model"],
-                    messages=[{"role": "user", "content": [
-                        {"type": "text", "text": "识别这张截图中的所有中文文字，按顺序输出，不要解释。"},
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}},
-                    ]}],
-                    temperature=0.0,
-                    max_tokens=800,
-                )
-                text = resp.choices[0].message.content or ""
-                result = ocr_to_action(text)
-                result["_provider"] = p["name"]
-                result["_ocr_text"] = text[:60]
-                return result
-            # 视觉理解模型: 输出结构化JSON动作
-            resp = client.chat.completions.create(
-                model=p["model"],
-                messages=[
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": [
-                        {"type": "text", "text": user_text},
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}},
-                    ]},
-                ],
-                temperature=0.0,
-                max_tokens=300,
-            )
-            text = resp.choices[0].message.content or ""
-            text = text.strip()
-            # 去掉可能的 ```json 包裹
-            if "```" in text:
-                text = text.split("```")[1].strip()
-                if text.startswith("json"):
-                    text = text[4:].strip()
-            start, end = text.find("{"), text.rfind("}")
-            if start == -1 or end == -1:
-                return {"action": "WAIT", "reason": f"[{p['name']}]解析失败: {text[:100]}"}
-            result = json.loads(text[start:end+1])
-            result["_provider"] = p["name"]
-            return result
-        except Exception as e:
-            last_err = e
-            print(f"⚠️ [{p['name']}] 调用失败({str(e)[:60]}), 切换下一家...")
-    return {"action": "WAIT", "reason": f"全部视觉模型失败: {str(last_err)[:80]}"}
+# ================= 模块级工具(无状态) =================
+def log(msg):
+    line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+    print(line, flush=True)
+    # 同时落盘 agent_run.log (供 evolver 采样分析, gitignore)
+    try:
+        with open("agent_run.log", "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def screencap(path):
+    """adb截屏保存到文件(15s超时, 避免adb无响应时主线程无限阻塞)"""
+    with open(path, "wb") as f:
+        subprocess.run([ADB, "exec-out", "screencap", "-p"], stdout=f, check=True, timeout=15)
+
+
+def capture_and_encode():
+    """截屏 -> 压缩 -> 返回(原图尺寸, base64)"""
+    screencap(SCREEN_PATH)
+    img = Image.open(SCREEN_PATH).convert("RGB")
+    orig_w, orig_h = img.size
+    scale = RESIZE_WIDTH / orig_w
+    img2 = img.resize((RESIZE_WIDTH, int(orig_h * scale)), Image.LANCZOS)
+    buf = io.BytesIO()
+    img2.save(buf, format="PNG")
+    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    return (orig_w, orig_h), b64
+
 
 def adb_tap(x, y):
-    subprocess.run([ADB, "shell", "input", "tap", str(int(x)), str(int(y))], check=True)
+    subprocess.run([ADB, "shell", "input", "tap", str(int(x)), str(int(y))], check=True, timeout=8)
+
 
 def adb_back():
-    subprocess.run([ADB, "shell", "input", "keyevent", "4"], check=True)
+    subprocess.run([ADB, "shell", "input", "keyevent", "4"], check=True, timeout=8)
+
 
 def adb_swipe_up():
     """向上滑动(查看下方任务); 用屏幕中下部滑到上部"""
-    subprocess.run([ADB, "shell", "input", "swipe", "500", "1600", "500", "400", "500"], check=True)
+    subprocess.run([ADB, "shell", "input", "swipe", "500", "1600", "500", "400", "500"], check=True, timeout=8)
+
 
 def adb_swipe_down():
     """向下滑动(回到页面顶部); 用屏幕上中部滑到下部"""
-    subprocess.run([ADB, "shell", "input", "swipe", "500", "600", "500", "1800", "500"], check=True)
+    subprocess.run([ADB, "shell", "input", "swipe", "500", "600", "500", "1800", "500"], check=True, timeout=8)
 
-# ===== 播放页等待: 听满15秒金币才到账, 不能立刻BACK =====
-PLAY_WAIT_SECONDS = 15
-_play_wait_start = 0.0
-
-# 连续BACK计数: 离开金币页后反复BACK只会退到首页/桌面, 第2次起暂停等用户手动回金币页
-_back_streak = 0
-
-# 广告刚关闭标记: 关广告后露出的播放页是残留页面, 不需要再等15秒
-_post_ad_round = False
-
-# 天天抽奖次数已用完标记(到期时间戳): 避免"金币页点立即抽奖 -> 0/10 -> BACK -> 又点立即抽奖"死循环
-_tian_draw_exhausted_until = 0.0
-
-def tian_draw_exhausted():
-    return time.time() < _tian_draw_exhausted_until
-
-# 看视频领金币次数已用完标记: 点一次看到"次数用完/明日再来"后确认, 扫描时按done处理
-_video_top_exhausted_until = 0.0
-_last_click_reason = ""
-
-def video_top_exhausted():
-    return time.time() < _video_top_exhausted_until
-
-# 请求进行一次全量扫描(例如刚确认某任务已用完时)
-_need_scan = False
-
-# 定向探测: 全量扫描后如果只剩"抽奖赢金币"待确认, 正常循环只允许点立即抽奖, 禁止乱点其他任务
-_only_probe_draw = False
-
-def play_wait_then_back(reason=""):
-    """播放页: 首轮开始计时, 等满PLAY_WAIT_SECONDS再BACK一次; 未满先等待. 返回PLAY_WAIT或BACK"""
-    global _play_wait_start
-    if _play_wait_start <= 0:
-        _play_wait_start = time.time()
-        log(f"[播放页] 检测到播放页, 开始计时(需听满{PLAY_WAIT_SECONDS}s) reason={reason}")
-    elapsed = time.time() - _play_wait_start
-    if elapsed < PLAY_WAIT_SECONDS:
-        remain = PLAY_WAIT_SECONDS - elapsed
-        log(f"[播放页] 已听{elapsed:.0f}s, 还需{remain:.0f}s, 先等待")
-        time.sleep(min(remain, random.uniform(5, 9)))
-        return "PLAY_WAIT"
-    log(f"[播放页] 已听满{elapsed:.0f}s, BACK返回(金币应已到账)")
-    adb_back()
-    _play_wait_start = 0.0
-    return "BACK"
-
-# 右上角关闭X的位置(相对坐标0~1000, 用户截图标定约925,107)
-CLOSE_X_REL, CLOSE_Y_REL = 925, 107
 
 def current_focus_window():
     """返回当前真实焦点窗口字符串(取最后一个非null的mCurrentFocus)"""
@@ -466,17 +304,51 @@ def current_focus_window():
                 last = s
     return last
 
+
+def current_focus_package():
+    """返回当前焦点窗口的包名(用于 force-stop 兜底); 取 'pkg/Activity' token 的包名部分"""
+    focus = current_focus_window()
+    if not focus:
+        return ""
+    for tok in focus.split():
+        if "/" in tok and "." in tok:
+            return tok.split("/")[0]
+    return ""
+
+
 def is_ad_activity():
-    """检查当前焦点是否仍在广告Activity(广告页屏蔽返回键)
-    只查当前焦点窗口, 不查整个dumpsys输出(避免历史残留误判)
-    覆盖两类容器: TMECoreActivity(广告页本体) + TransPortraitADActivity(点跳转后进入的新页面)"""
+    """检查当前焦点是否仍在广告Activity(广告页屏蔽返回键)"""
     focus = current_focus_window()
     return any(k in focus for k in
                ("TMECoreActivity", "tmead", "TransPortraitADActivity", "com.qq.e.tg"))
 
+
 def is_in_qqmusic():
     """当前焦点是否在QQ音乐内(主界面/金币页/广告页都属于QQ音乐包)"""
     return "com.tencent.qqmusic" in current_focus_window()
+
+
+def is_external_app():
+    """当前焦点是否落在浏览器/应用商店等外部App(广告误跳目标); 返回命中的包名片段, 未命中返回空串"""
+    focus = current_focus_window()
+    if not focus:
+        return ""
+    _ext_markers = (
+        "com.android.chrome", "com.chrome", "com.tencent.mtt", "com.huawei.browser",
+        "com.miui.browser", "com.UCMobile", "com.ucmobile", "org.chromium",
+        "com.oppo.browser", "com.vivo.browser", "com.sec.android.app.sbrowser",
+        "com.android.vending", "com.bbk.appstore", "com.huawei.appmarket",
+        "com.xiaomi.market", "com.oppo.market", "com.tencent.android.qqdownloader",
+        "com.android.packageinstaller", "com.estrongs.android.pop",
+        # 电商类(广告常跳转目标): 淘宝/天猫、京东、拼多多
+        "com.taobao.taobao", "com.taobao.litetao", "com.jingdong.app.mall",
+        "com.jd.jrapp", "com.xunmeng.pinduoduo",
+    )
+    for m in _ext_markers:
+        if m in focus:
+            return m
+    return ""
+
 
 def tap_close(ow, oh):
     """点击右上角X关闭广告(用户截图标定约925,107)"""
@@ -485,59 +357,34 @@ def tap_close(ow, oh):
     log(f"[点X关闭] 坐标({x},{y})")
     adb_tap(x, y)
 
-def uia_detect_click():
-    """版本2: 金币页硬编码优先. uiautomator dump命中白名单任务文本 -> 返回像素中心坐标; 未命中返回None"""
+
+def save_sample(round_no, reason):
+    """卡住时被动采样: 3张间隔截图 + 上下文(日志尾部/焦点/状态) 到 ad_samples/<ts>_r<n>/"""
     try:
-        subprocess.run([ADB, "shell", "uiautomator", "dump", "/sdcard/uidump.xml"],
-                       capture_output=True, timeout=8)
-        out = subprocess.run([ADB, "exec-out", "cat", "/sdcard/uidump.xml"],
-                             capture_output=True, timeout=8)
-        xml = out.stdout.decode("utf-8", errors="ignore")
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        d = SAMPLE_DIR / f"{ts}_r{round_no}"
+        d.mkdir(parents=True, exist_ok=True)
+        for i in range(3):
+            screencap(SCREEN_PATH)
+            with open(d / f"shot_{i}.png", "wb") as f:
+                f.write(Path(SCREEN_PATH).read_bytes())
+            if i < 2:
+                time.sleep(2)
+        focus = current_focus_window()
+        ctx = [f"round={round_no}  time={time.strftime('%H:%M:%S')}  reason={reason}",
+               f"focus={focus}", ""]
+        try:
+            with open("agent_run.log", "r", encoding="utf-8") as f:
+                tail = f.readlines()[-40:]
+            ctx.append("===== 最近日志 =====")
+            ctx.extend(l.rstrip("\n") for l in tail)
+        except Exception:
+            pass
+        (d / "context.txt").write_text("\n".join(ctx), encoding="utf-8")
+        log(f"[watchdog] 已采样卡住样本: {d}")
     except Exception as e:
-        log(f"[硬编码] uiautomator dump失败: {str(e)[:40]}")
-        return None
-    if not xml or "<node" not in xml:
-        return None
-    # ===== 浮层检测: 转盘/抽奖类浮层盖住金币页时, dump拿不到浮层自己的按钮(WebView), 反而命中下层无效节点
-    # 命中这些特征说明当前是浮层页面, 直接交给AI视觉(截图能看到浮层真实按钮)
-    # 只认【今日剩余抽奖次数】专属特征(金币页任务卡带"幸运大转盘"字样是正常的, 不能误伤转AI)
-    for _ft in ("今日剩余抽奖次数",):
-        if _ft in xml:
-            log(f"[硬编码] 检测到浮层特征[{_ft}], 转AI视觉判断")
-            return None
-    click_hits = []   # (面积, cx, cy, txt, kw)
-    for m in re.finditer(r'<node[^>]*>', xml):
-        node = m.group(0)
-        t = re.search(r'text="([^"]*)"', node)
-        d = re.search(r'content-desc="([^"]*)"', node)
-        txt = (t.group(1) if t else "") or (d.group(1) if d else "")
-        if not txt:
-            continue
-        kw = _match_task_keyword(txt)
-        if kw is None:
-            continue
-        b = re.search(r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"', node)
-        if not b:
-            continue
-        x1, y1, x2, y2 = (int(b.group(i)) for i in range(1, 5))
-        w, h = x2 - x1, y2 - y1
-        # 过滤无效bounds: 宽高必须>20px且落在屏幕内(有些节点是0尺寸装饰/异常节点)
-        if w < 20 or h < 20 or x2 > 1300 or y2 > 2700:
-            continue
-        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-        clickable = re.search(r'clickable="([^"]*)"', node)
-        area = w * h
-        # 只收真正clickable的按钮(广告闭环弹窗/原生按钮). 金币页任务列表是WebView,
-        # 非clickable文本节点bounds不可靠(全部堆叠在同一行), 硬编码点击必然无效, 一律转AI视觉定位
-        if clickable and clickable.group(1) == "true":
-            click_hits.append((area, cx, cy, txt, kw))
-    # 优先可点击节点中面积最大的(真正的任务按钮)
-    if click_hits:
-        click_hits.sort(key=lambda x: x[0], reverse=True)
-        _, cx, cy, txt, kw = click_hits[0]
-        log(f"[硬编码命中] 可点击节点 文本={txt[:26]} 命中={kw} 坐标({cx},{cy})")
-        return cx, cy
-    return None
+        log(f"[watchdog] 采样失败: {str(e)[:60]}")
+
 
 def _match_task_keyword(txt):
     """返回txt命中的白名单关键词; 命中排除词或非白名单则返回None"""
@@ -548,150 +395,399 @@ def _match_task_keyword(txt):
             return kw
     return None
 
-def run_once():
-    """单轮: 硬编码优先 -> 截屏识图兜底"""
-    global _last_had_click, _last_uia_pos, _last_uia_time, _uia_streak, _play_wait_start, _back_streak, _post_ad_round, _tian_draw_exhausted_until, _video_top_exhausted_until, _last_click_reason, _need_scan, _only_probe_draw
-    post_ad = _post_ad_round   # 本轮的"刚关广告"状态只消费一次
-    _post_ad_round = False
-    last_click = _last_click_reason   # 上一轮点的是什么(只用一次)
-    _last_click_reason = ""
-    if random.random() < SKIP_PROB:
-        w = random.uniform(4, 10)
-        log(f"[跳过本轮] 随机暂停 {w:.1f}s")
-        time.sleep(w)
-        return
 
-    # ===== 版本2: 金币页硬编码优先(不调AI) =====
-    # 只在非广告状态下执行(广告页由状态机接管, 不进run_once)
-    uia_hit = uia_detect_click()
-    if uia_hit:
-        cx, cy = uia_hit
-        _play_wait_start = 0.0   # 已回到金币页, 播放计时复位
-        _back_streak = 0         # 金币页任务可点, BACK计数复位
-        # ===== 防卡死: 同一按钮连续命中3次(45秒内, 间距<30px) -> 判定无效, 改下滑 =====
-        now = time.time()
-        if (_last_uia_pos is not None and
-                abs(cx - _last_uia_pos[0]) < 30 and abs(cy - _last_uia_pos[1]) < 30 and
-                now - _last_uia_time < 45):
-            _uia_streak += 1
-        else:
-            _uia_streak = 0
-        _last_uia_pos = (cx, cy)
-        _last_uia_time = now
-        if _uia_streak >= 2:   # 第3次命中同一按钮
-            log(f"[防卡死] 连续3次命中同一按钮({cx},{cy}), 判定无效, 改下滑换任务")
-            _uia_streak = 0
-            _last_uia_pos = None
-            adb_swipe_up()
+def ocr_to_action(text: str) -> dict:
+    """纯OCR模型: 把识别到的中文文字按关键词规则转成动作(无坐标)"""
+    t = text
+    # 商品/购物/购买/第三方App特征 → 返回(误跳第三方)
+    if any(k in t for k in ["商品", "购物", "购买", "加入购物车", "立即购买", "店铺", "客服",
+                            "降价通知", "京东", "淘宝", "拼多多", "领券", "下单", "满减", "自营"]):
+        return {"action": "BACK", "reason": f"OCR识别到商品页/第三方App关键词: {t[:40]}"}
+    # 广告播放/剩余秒 → 等待
+    if any(k in t for k in ["剩余", "秒", "广告播放", "倒计时", "播放中"]):
+        return {"action": "WAIT", "reason": f"OCR识别到广告播放关键词: {t[:40]}"}
+    # 活动任务/打开/去/下载 → 下滑(跳第三方App任务)
+    if any(k in t for k in ["活动任务", "打开", "去完成", "去分享", "去关注", "下载", "安装"]):
+        return {"action": "SWIPE", "reason": f"OCR识别到活动任务区关键词: {t[:40]}"}
+    # 拿不准 → 下滑看看
+    return {"action": "SWIPE", "reason": f"OCR无明确关键词, 下滑: {t[:40]}"}
+
+
+# ================= 主Agent(状态封装) =================
+class QQCoinAgent:
+    def __init__(self):
+        # 心跳 / watchdog
+        self._last_heartbeat = time.time()
+        self._watchdog_tripped = False
+        self._current_round = 0
+        # 防卡死 / 播放页计时
+        self._last_had_click = False
+        self._last_uia_pos = None      # 上一次硬编码点击的坐标(防卡死用)
+        self._last_uia_time = 0.0      # 上一次硬编码点击的时间戳
+        self._uia_streak = 0           # 同一按钮连续命中计数(>=2 即第3次 -> 下滑换任务)
+        self._play_wait_start = 0.0    # 播放页计时起点
+        self._back_streak = 0          # 连续BACK计数
+        # 任务用完标记(到期时间戳)
+        self._tian_draw_exhausted_until = 0.0
+        self._video_top_exhausted_until = 0.0
+        self._last_click_reason = ""
+        # 全量扫描 / 定向探测
+        self._need_scan = False
+        self._only_probe_draw = False
+        self._probe_draw_attempts = 0
+        # 动作历史(给模型的短期记忆)
+        self._recent_actions = []
+        # 调用统计
+        self._vlm_calls = 0
+        # 广告状态机运行时(每次run重置)
+        self.ad_state = 0
+        self.ad_watch_start = 0.0
+        self.ad_close_streak = 0
+        self._ad_wait_streak = 0
+        self._post_ad_round = False
+
+    # ---------- 记忆 / 心跳 ----------
+    def remember_action(self, action, reason=""):
+        self._recent_actions.append((str(action), str(reason)[:20]))
+        if len(self._recent_actions) > 10:
+            del self._recent_actions[:-10]
+
+    def action_history_text(self, n=6, with_reason=True):
+        if not self._recent_actions:
+            return "（无）"
+        items = self._recent_actions[-n:]
+        if with_reason:
+            return " -> ".join(f"{a}({r})" if r else a for a, r in items)
+        return " -> ".join(a for a, _ in items)
+
+    def heartbeat(self):
+        self._last_heartbeat = time.time()
+
+    def watchdog_check_pause(self):
+        if not self._watchdog_tripped:
+            return
+        log("[watchdog] 已暂停: 请处理手机上的广告/登录/验证码等页面, 处理完在终端按回车继续")
+        try:
+            input()
+        except Exception:
+            time.sleep(30)
+        self._watchdog_tripped = False
+        self._last_heartbeat = time.time()
+        log("[watchdog] 已恢复, 继续执行")
+
+    def start_watchdog(self):
+        def _loop():
+            while True:
+                time.sleep(10)
+                idle = time.time() - self._last_heartbeat
+                if idle > WATCHDOG_TIMEOUT and not self._watchdog_tripped:
+                    self._watchdog_tripped = True
+                    log(f"[watchdog] 超过{int(idle)}s无进展, 疑似卡死, 开始采样并暂停等用户处理")
+                    save_sample(self._current_round, f"watchdog {int(idle)}s无进展")
+                    log("[watchdog] 采样完成(ad_samples/), 主循环将在下一检查点暂停")
+        threading.Thread(target=_loop, daemon=True).start()
+
+    # ---------- 任务用完判断 ----------
+    def tian_draw_exhausted(self):
+        return time.time() < self._tian_draw_exhausted_until
+
+    def video_top_exhausted(self):
+        return time.time() < self._video_top_exhausted_until
+
+    def play_wait_then_back(self, reason=""):
+        """播放页: 首轮开始计时, 等满15秒再BACK一次; 未满先等待. 返回PLAY_WAIT或BACK"""
+        if self._play_wait_start <= 0:
+            self._play_wait_start = time.time()
+            log(f"[播放页] 检测到播放页, 开始计时(需听满{PLAY_WAIT_SECONDS}s) reason={reason}")
+        elapsed = time.time() - self._play_wait_start
+        if elapsed < PLAY_WAIT_SECONDS:
+            remain = PLAY_WAIT_SECONDS - elapsed
+            log(f"[播放页] 已听{elapsed:.0f}s, 还需{remain:.0f}s, 先等待")
+            time.sleep(min(remain, random.uniform(5, 9)))
+            return "PLAY_WAIT"
+        log(f"[播放页] 已听满{elapsed:.0f}s, BACK返回(金币应已到账)")
+        adb_back()
+        self._play_wait_start = 0.0
+        return "BACK"
+
+    # ---------- VLM 调用(降级链) ----------
+    def call_vlm(self, img_b64, mode="normal"):
+        """按降级链调用多模态视觉模型, 返回动作dict; 全部失败返回WAIT
+        mode: normal=金币页常规判断, ad=广告页按钮定位, close=广告关闭按钮, nav=导航回金币页, scan=全量扫描
+        硬上限: 单次请求20s且不重试, 整条降级链总耗时不超过60s"""
+        self._vlm_calls += 1
+        last_err = None
+        start_ts = time.time()
+        VLM_TOTAL_BUDGET = 60   # 整条降级链总预算(秒), 超过直接返回WAIT, 防止主线程长时间静默
+        sys_prompt = (AD_ENTRY_PROMPT if mode == "ad" else
+                      AD_CLOSE_PROMPT if mode == "close" else
+                      NAV_PROMPT if mode == "nav" else
+                      SCAN_PROMPT if mode == "scan" else SYSTEM_PROMPT)
+        user_text = "分析这张手机截图，按规则输出JSON。"
+        if mode == "scan":
+            user_text = "扫描这张截图，按规则输出四个任务状态JSON。"
+            if self.tian_draw_exhausted():
+                user_text += " (抽奖赢金币本会话已确认0/10, 直接按done处理)"
+            if self.video_top_exhausted():
+                user_text += " (看视频领金币本会话已确认次数用完, 直接按done处理)"
+        elif mode == "normal":
+            user_text = f"最近动作历史(旧→新): {self.action_history_text(with_reason=False)}\n" + user_text
+            if self.tian_draw_exhausted():
+                user_text = ("当前状态: 天天抽奖/抽奖赢金币的看广告次数已用完(0/10), "
+                             "本轮严禁再点【立即抽奖】; 优先点看视频领金币/看视频得高额金币, 没有就SWIPE/TOP。\n") + user_text
+            if self.video_top_exhausted():
+                user_text = ("当前状态: 看视频领金币的次数已用完, 本轮严禁再点该板块; "
+                             "优先点看视频得高额金币/金币抽奖, 没有就SWIPE/TOP。\n") + user_text
+            if self._only_probe_draw:
+                user_text = ("当前状态: 四个任务只剩【抽奖赢金币】待确认。本轮只允许点【立即抽奖】(抽奖赢金币那一行); "
+                             "其他任何任务(看视频/浏览广告/领金币/摇钱树/签到/活动任务)一律不点; "
+                             "看不到立即抽奖就SWIPE或TOP。\n") + user_text
+        for p in VLM_PROVIDERS:
+            if time.time() - start_ts >= VLM_TOTAL_BUDGET:
+                log(f"[VLM] 降级链总耗时已超{VLM_TOTAL_BUDGET}s, 停止重试, 返回WAIT")
+                break
+            api_key = os.getenv(p["api_key_env"])
+            if not api_key:
+                continue
+            try:
+                client = OpenAI(base_url=p["base_url"], api_key=api_key, timeout=20, max_retries=0)
+                if p.get("is_ocr"):
+                    resp = client.chat.completions.create(
+                        model=p["model"],
+                        messages=[{"role": "user", "content": [
+                            {"type": "text", "text": "识别这张截图中的所有中文文字，按顺序输出，不要解释。"},
+                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}},
+                        ]}],
+                        temperature=0.0,
+                        max_tokens=800,
+                    )
+                    text = resp.choices[0].message.content or ""
+                    result = ocr_to_action(text)
+                    result["_provider"] = p["name"]
+                    result["_ocr_text"] = text[:60]
+                    return result
+                resp = client.chat.completions.create(
+                    model=p["model"],
+                    messages=[
+                        {"role": "system", "content": sys_prompt},
+                        {"role": "user", "content": [
+                            {"type": "text", "text": user_text},
+                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}},
+                        ]},
+                    ],
+                    temperature=0.0,
+                    max_tokens=300,
+                )
+                text = resp.choices[0].message.content or ""
+                text = text.strip()
+                if "```" in text:
+                    text = text.split("```")[1].strip()
+                    if text.startswith("json"):
+                        text = text[4:].strip()
+                start, end = text.find("{"), text.rfind("}")
+                if start == -1 or end == -1:
+                    return {"action": "WAIT", "reason": f"[{p['name']}]解析失败: {text[:100]}"}
+                result = json.loads(text[start:end + 1])
+                result["_provider"] = p["name"]
+                return result
+            except Exception as e:
+                last_err = e
+                log(f"[VLM] {p['name']} 调用失败({str(e)[:60]}), 切换下一家 (已耗时{time.time() - start_ts:.0f}s)")
+        return {"action": "WAIT", "reason": f"全部视觉模型失败: {str(last_err)[:80]}"}
+
+    # ---------- 金币页硬编码优先 ----------
+    def uia_detect_click(self):
+        """金币页硬编码优先. uiautomator dump命中白名单任务文本 -> 返回像素中心坐标; 未命中返回None"""
+        try:
+            subprocess.run([ADB, "shell", "uiautomator", "dump", "/sdcard/uidump.xml"],
+                           capture_output=True, timeout=8)
+            out = subprocess.run([ADB, "exec-out", "cat", "/sdcard/uidump.xml"],
+                                 capture_output=True, timeout=8)
+            xml = out.stdout.decode("utf-8", errors="ignore")
+        except Exception as e:
+            log(f"[硬编码] uiautomator dump失败: {str(e)[:40]}")
+            return None
+        if not xml or "<node" not in xml:
+            return None
+        # 浮层检测: 转盘/抽奖类浮层盖住金币页时, dump拿不到浮层自己的按钮(WebView), 反而命中下层无效节点
+        for _ft in ("今日剩余抽奖次数",):
+            if _ft in xml:
+                log(f"[硬编码] 检测到浮层特征[{_ft}], 转AI视觉判断")
+                return None
+        click_hits = []   # (面积, cx, cy, txt, kw)
+        for m in re.finditer(r'<node[^>]*>', xml):
+            node = m.group(0)
+            t = re.search(r'text="([^"]*)"', node)
+            d = re.search(r'content-desc="([^"]*)"', node)
+            txt = (t.group(1) if t else "") or (d.group(1) if d else "")
+            if not txt:
+                continue
+            kw = _match_task_keyword(txt)
+            if kw is None:
+                continue
+            b = re.search(r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"', node)
+            if not b:
+                continue
+            x1, y1, x2, y2 = (int(b.group(i)) for i in range(1, 5))
+            w, h = x2 - x1, y2 - y1
+            if w < 20 or h < 20 or x2 > 1300 or y2 > 2700:
+                continue
+            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+            clickable = re.search(r'clickable="([^"]*)"', node)
+            area = w * h
+            if clickable and clickable.group(1) == "true":
+                click_hits.append((area, cx, cy, txt, kw))
+        if click_hits:
+            click_hits.sort(key=lambda x: x[0], reverse=True)
+            _, cx, cy, txt, kw = click_hits[0]
+            log(f"[硬编码命中] 可点击节点 文本={txt[:26]} 命中={kw} 坐标({cx},{cy})")
+            return cx, cy
+        return None
+
+    # ---------- 单轮: 硬编码优先 -> 截屏识图兜底 ----------
+    def run_once(self):
+        post_ad = self._post_ad_round
+        self._post_ad_round = False
+        last_click = self._last_click_reason
+        self._last_click_reason = ""
+        if random.random() < SKIP_PROB:
+            w = random.uniform(4, 10)
+            log(f"[跳过本轮] 随机暂停 {w:.1f}s")
+            time.sleep(w)
+            return "SKIP"
+
+        # 版本2: 金币页硬编码优先(不调AI)
+        uia_hit = self.uia_detect_click()
+        if uia_hit:
+            cx, cy = uia_hit
+            self._play_wait_start = 0.0
+            self._back_streak = 0
+            now = time.time()
+            if (self._last_uia_pos is not None and
+                    abs(cx - self._last_uia_pos[0]) < 30 and abs(cy - self._last_uia_pos[1]) < 30 and
+                    now - self._last_uia_time < 45):
+                self._uia_streak += 1
+            else:
+                self._uia_streak = 0
+            self._last_uia_pos = (cx, cy)
+            self._last_uia_time = now
+            if self._uia_streak >= 2:   # 第3次命中同一按钮
+                log(f"[防卡死] 连续3次命中同一按钮({cx},{cy}), 判定无效, 改下滑换任务")
+                self._uia_streak = 0
+                self._last_uia_pos = None
+                adb_swipe_up()
+                w = random.uniform(WAIT_MIN, WAIT_MAX)
+                log(f"[等待] {w:.1f}s")
+                time.sleep(w)
+                return "SWIPE"
+            cx += random.randint(-OFFSET, OFFSET)
+            cy += random.randint(-OFFSET, OFFSET)
+            log(f"[点击:硬编码] 坐标({cx},{cy})")
+            try:
+                adb_tap(cx, cy)
+            except Exception as e:
+                log(f"[点击失败] {e}")
+            self._last_had_click = True
+            self._probe_draw_attempts = 0
+            self.remember_action("CLICK", "硬编码")
             w = random.uniform(WAIT_MIN, WAIT_MAX)
             log(f"[等待] {w:.1f}s")
             time.sleep(w)
-            return "SWIPE"
-        cx += random.randint(-OFFSET, OFFSET)
-        cy += random.randint(-OFFSET, OFFSET)
-        log(f"[点击:硬编码] 坐标({cx},{cy})")
+            self.heartbeat()
+            return "CLICK"
+
         try:
-            adb_tap(cx, cy)
+            (ow, oh), b64 = capture_and_encode()
         except Exception as e:
-            log(f"[点击失败] {e}")
-        _last_had_click = True
-        remember_action("CLICK", "硬编码")
-        w = random.uniform(WAIT_MIN, WAIT_MAX)
-        log(f"[等待] {w:.1f}s")
-        time.sleep(w)
-        return "CLICK"
+            log(f"[截屏失败] {e} —— 检查手机是否连接/USB调试是否开启")
+            time.sleep(5)
+            return "FAIL"
 
-    try:
-        (ow, oh), b64 = capture_and_encode()
-    except Exception as e:
-        log(f"[截屏失败] {e} —— 检查手机是否连接/USB调试是否开启")
-        time.sleep(5)
-        return "FAIL"
+        log(f"[记忆] 最近动作: {self.action_history_text()}")
+        action = self.call_vlm(b64)
+        act = action.get("action", "WAIT")
+        provider = action.get("_provider", "?")
+        reason = action.get("reason", "")
 
-    log(f"[记忆] 最近动作: {action_history_text()}")
-    action = call_vlm(b64)
-    act = action.get("action", "WAIT")
-    provider = action.get("_provider", "?")
-    reason = action.get("reason", "")
+        # 看视频领金币次数用完确认
+        exhaustion_words = ("次数已用完", "次数0", "0次", "明日再来", "已领完", "已完成", "派发完毕")
+        if "看视频领金币" in reason and any(k in reason for k in exhaustion_words):
+            self._video_top_exhausted_until = time.time() + 600
+            self._need_scan = True
+            log("[任务状态] 看视频领金币次数已用完/已完成, 本会话不再点该板块")
+        elif "看视频领金币" in last_click and any(k in reason for k in exhaustion_words):
+            self._video_top_exhausted_until = time.time() + 600
+            self._need_scan = True
+            log("[任务状态] 点击看视频领金币后出现次数用完/明日再来, 本会话不再点该板块")
 
-    # 看视频领金币次数用完确认: ①本轮页面直接说明; ②上一轮点的是看视频领金币, 本轮出现"次数用完/明日再来"
-    exhaustion_words = ("次数已用完", "次数0", "0次", "明日再来", "已领完", "已完成", "派发完毕")
-    if "看视频领金币" in reason and any(k in reason for k in exhaustion_words):
-        _video_top_exhausted_until = time.time() + 600
-        _need_scan = True
-        log("[任务状态] 看视频领金币次数已用完/已完成, 本会话不再点该板块")
-    elif "看视频领金币" in last_click and any(k in reason for k in exhaustion_words):
-        _video_top_exhausted_until = time.time() + 600
-        _need_scan = True
-        log("[任务状态] 点击看视频领金币后出现次数用完/明日再来, 本会话不再点该板块")
-
-    if act == "CLICK":
-        if _only_probe_draw and not ("立即抽奖" in reason or "抽奖赢金币" in reason):
-            log(f"[定向探测] 只差抽奖赢金币确认, 跳过其他任务点击 -> 上滑 reason={reason}")
+        if act == "CLICK":
+            if self._only_probe_draw and not ("立即抽奖" in reason or "抽奖赢金币" in reason):
+                log(f"[定向探测] 只差抽奖赢金币确认, 跳过其他任务点击 -> 上滑 reason={reason}")
+                adb_swipe_up()
+                act = "SWIPE"
+            elif self.video_top_exhausted() and "看视频领金币" in reason:
+                log(f"[防循环] 看视频领金币次数已用完, 跳过该板块点击 -> 上滑 reason={reason}")
+                adb_swipe_up()
+                act = "SWIPE"
+            elif self.tian_draw_exhausted() and ("立即抽奖" in reason or "抽奖赢金币" in reason):
+                log(f"[防循环] 天天抽奖次数已用完, 跳过立即抽奖 -> 上滑找看视频 reason={reason}")
+                adb_swipe_up()
+                act = "SWIPE"
+            else:
+                try:
+                    rx = float(action.get("x", 500))
+                    ry = float(action.get("y", 500))
+                except (TypeError, ValueError):
+                    rx, ry = 500, 500
+                x = int(rx / 1000 * ow)
+                y = int(ry / 1000 * oh)
+                x += random.randint(-OFFSET, OFFSET)
+                y += random.randint(-OFFSET, OFFSET)
+                log(f"[点击:{provider}] 坐标({x},{y}) reason={reason}")
+                try:
+                    adb_tap(x, y)
+                except Exception as e:
+                    log(f"[点击失败] {e}")
+                if "立即抽奖" in reason or "抽奖赢金币" in reason:
+                    self._probe_draw_attempts = 0
+                self._last_click_reason = reason
+                self._last_had_click = True
+        elif act == "SWIPE":
+            log(f"[下滑:{provider}] reason={reason}")
             adb_swipe_up()
-            act = "SWIPE"
-        elif video_top_exhausted() and "看视频领金币" in reason:
-            log(f"[防循环] 看视频领金币次数已用完, 跳过该板块点击 -> 上滑 reason={reason}")
-            adb_swipe_up()
-            act = "SWIPE"
-        elif tian_draw_exhausted() and ("立即抽奖" in reason or "抽奖赢金币" in reason):
-            # 天天抽奖0/10后模型仍想点"立即抽奖": 代码强制拦截, 否则会在金币页↔抽奖页来回死循环
-            log(f"[防循环] 天天抽奖次数已用完, 跳过立即抽奖 -> 上滑找看视频 reason={reason}")
-            adb_swipe_up()
-            act = "SWIPE"
-        else:
-            # 相对坐标(0~1000)映射回原图坐标; 模型可能返回字符串, 先转float
-            try:
-                rx = float(action.get("x", 500))
-                ry = float(action.get("y", 500))
-            except (TypeError, ValueError):
-                rx, ry = 500, 500
-            x = int(rx / 1000 * ow)
-            y = int(ry / 1000 * oh)
-            # 随机偏移反风控
-            x += random.randint(-OFFSET, OFFSET)
-            y += random.randint(-OFFSET, OFFSET)
-            log(f"[点击:{provider}] 坐标({x},{y}) reason={reason}")
-            try:
-                adb_tap(x, y)
-            except Exception as e:
-                log(f"[点击失败] {e}")
-            # 记录本轮点了什么, 供下一轮判断"次数用完"提示
-            _last_click_reason = reason
-            # 点击即视为广告流程有进展, 重置卡死计数
-            _last_had_click = True
-    elif act == "SWIPE":
-        log(f"[下滑:{provider}] reason={reason}")
-        adb_swipe_up()
-    elif act == "TOP":
-        # 模型根据动作历史判断"原地重复下滑" → 滚回页面顶部重新扫描
-        log(f"[回顶部:{provider}] reason={reason}")
-        for _ in range(6):
-            adb_swipe_down()
-            time.sleep(0.6)
-    elif act == "PLAY_WAIT":
-        if post_ad:
-            # 刚关完广告露出的播放页是残留页面, 广告15秒已经看完, 直接BACK不再等
-            log(f"[播放页:{provider}] 广告刚关闭, 判定为残留播放页, 直接BACK")
-            adb_back()
-            act = "BACK"
-        else:
-            # 真正的播放页广告: 等满15秒金币到账再BACK, 不能立刻返回丢奖励
-            log(f"[播放页:{provider}] reason={reason}")
-            act = play_wait_then_back(reason)
-    elif act == "BACK":
-        # 天天抽奖0/10: 记录"已用完", 回金币页后滚回顶部, 避免又点立即抽奖形成死循环
-        exhausted_now = ("天天抽奖" in reason and ("用完" in reason or "0/" in reason or "0次" in reason))
-        if exhausted_now:
-            _tian_draw_exhausted_until = time.time() + 600
-            _only_probe_draw = False   # 抽奖赢金币已确认用完, 退出定向探测
-            _need_scan = True
-            log("[抽奖状态] 天天抽奖次数已用完(0/10), 本会话不再点立即抽奖; 立即做一次全量扫描确认是否全部完成")
-        # 非广告页被判"非金币页": 先让导航AI判断能否从首页/我的一步步点回金币页, 不再盲目BACK退到桌面死循环
-        try:
-            nav = call_vlm(b64, mode="nav")
-            nact = nav.get("action", "BACK")
-            log(f"[导航:{nav.get('_provider','?')}] {nact} reason={nav.get('reason','')}")
+        elif act == "TOP":
+            log(f"[回顶部:{provider}] reason={reason}")
+            for _ in range(6):
+                adb_swipe_down()
+                time.sleep(0.6)
+        elif act == "PLAY_WAIT":
+            if post_ad:
+                log(f"[播放页:{provider}] 广告刚关闭, 判定为残留播放页, 直接BACK")
+                adb_back()
+                act = "BACK"
+            else:
+                log(f"[播放页:{provider}] reason={reason}")
+                act = self.play_wait_then_back(reason)
+        elif act == "BACK":
+            exhausted_now = ("天天抽奖" in reason and ("用完" in reason or "0/" in reason or "0次" in reason))
+            if exhausted_now:
+                self._tian_draw_exhausted_until = time.time() + 600
+                self._only_probe_draw = False
+                self._need_scan = True
+                log("[抽奖状态] 天天抽奖次数已用完(0/10), 本会话不再点立即抽奖; 立即做一次全量扫描确认是否全部完成")
+            # Q3优化: 当前仍在QQ音乐内(金币页/子页面/广告页)时, 直接BACK即可, 不浪费一次导航VLM;
+            # 只有真正离开QQ音乐(桌面/外部App)才调用导航VLM逐步找回金币页。
+            if is_in_qqmusic():
+                nact = "BACK"
+                log(f"[导航] 仍在QQ音乐内, 跳过导航VLM直接BACK")
+            else:
+                try:
+                    nav = self.call_vlm(b64, mode="nav")
+                    nact = nav.get("action", "BACK")
+                    log(f"[导航:{nav.get('_provider', '?')}] {nact} reason={nav.get('reason', '')}")
+                except Exception as e:
+                    log(f"[导航异常] {str(e)[:40]}")
+                    nact = "BACK"
             if nact == "CLICK":
                 try:
                     rx = float(nav.get("x", 500))
@@ -703,206 +799,157 @@ def run_once():
                 log(f"[导航点击] 坐标({x},{y})")
                 adb_tap(x, y)
                 act = "CLICK"
-                _back_streak = 0
+                self._back_streak = 0
             elif nact == "SWIPE":
                 adb_swipe_up()
                 act = "SWIPE"
-                _back_streak = 0
+                self._back_streak = 0
             elif nact == "NONE":
-                act = "WAIT"   # 导航AI确认已在金币页, 本轮不动作
-                _back_streak = 0
-        except Exception as e:
-            log(f"[导航异常] {str(e)[:40]}")
-        if act == "BACK":
-            _back_streak += 1
-            if _back_streak >= 2:
-                # 连导航AI都连续判定要返回: 暂停等用户手动回金币页(最后手段)
-                log(f"[导航失败] 连续{_back_streak}次无法回到金币页, 暂停30秒 —— 请手动回到金币狂欢节页面")
-                time.sleep(30)
+                act = "WAIT"
+                self._back_streak = 0
+            if act == "BACK":
+                self._back_streak += 1
+                if self._back_streak >= 2:
+                    log(f"[导航失败] 连续{self._back_streak}次无法回到金币页, 暂停30秒 —— 请手动回到金币狂欢节页面")
+                    time.sleep(30)
+                else:
+                    log(f"[返回:{provider}] reason={reason}")
+                    adb_back()
+        else:
+            log(f"[等待:{provider}] reason={reason}")
+
+        if act != "PLAY_WAIT":
+            self._play_wait_start = 0.0
+        if act in ("CLICK", "SWIPE", "TOP", "PLAY_WAIT", "WAIT"):
+            self._back_streak = 0
+
+        self.remember_action(act, reason)
+        w = random.uniform(WAIT_MIN, WAIT_MAX)
+        log(f"[等待] {w:.1f}s")
+        time.sleep(w)
+        self.heartbeat()
+        return act
+
+    # ---------- 终局验证扫描 ----------
+    def full_scan(self):
+        """全量扫描: 回到金币页顶部, 逐屏下滑到底, 检查四个指定任务是否还有可做的.
+        只有确认在金币页且整页扫描都没发现可做任务时, 才返回 True(今日任务全部完成)"""
+        log("[全量扫描] 开始: 回到金币页顶部并逐屏扫描四个任务")
+        self.heartbeat()
+        for _ in range(6):
+            adb_swipe_down()
+            time.sleep(0.4)
+        seen_available = set()
+        seen_done = set()
+        coin_page_seen = False
+        draw_step = None
+        for step in range(8):
+            try:
+                (ow, oh), b64 = capture_and_encode()
+                result = self.call_vlm(b64, mode="scan")
+            except Exception as e:
+                log(f"[全量扫描] 第{step + 1}屏失败: {str(e)[:40]}")
+                break
+            if result.get("is_coin_page"):
+                coin_page_seen = True
+            states = []
+            for t in SCAN_TASKS:
+                st = str(result.get(t, "absent")).strip().lower()
+                if t == "看视频领金币" and step >= 4:
+                    st = "absent"
+                states.append(f"{t}={st}")
+                if st == "available":
+                    seen_available.add(t)
+                    if t == "抽奖赢金币" and draw_step is None:
+                        draw_step = step
+                elif st == "done":
+                    seen_done.add(t)
+            log(f"[全量扫描] 第{step + 1}屏: " + "  ".join(states))
+            self.heartbeat()
+            if step < 7:
+                adb_swipe_up()
+                time.sleep(0.6)
+        if self.tian_draw_exhausted():
+            seen_available.discard("抽奖赢金币")
+            seen_done.add("抽奖赢金币")
+        if self.video_top_exhausted():
+            seen_available.discard("看视频领金币")
+            seen_done.add("看视频领金币")
+        elif "看视频领金币" in seen_done and "看视频领金币" not in seen_available:
+            self._video_top_exhausted_until = time.time() + 600
+            seen_done.add("看视频领金币")
+        if seen_available == {"抽奖赢金币"}:
+            self._probe_draw_attempts += 1
+            if self._probe_draw_attempts >= 2:
+                log("[定向探测] 连续2次全量扫描只剩抽奖赢金币且期间无成功点击, 判定为0/10假available, 按已完成处理")
+                self._tian_draw_exhausted_until = time.time() + 600
+                seen_available.discard("抽奖赢金币")
+                seen_done.add("抽奖赢金币")
+                self._only_probe_draw = False
             else:
-                log(f"[返回:{provider}] reason={reason}")
-                adb_back()
-        # BACK后如果还在广告页: 广告流程尚未走完, 交给主循环ad_streak判断是否重启, 不在此打断
-    else:
-        log(f"[等待:{provider}] reason={reason}")
+                self._only_probe_draw = True
+                log("[全量扫描] 只剩抽奖赢金币待确认, 正常循环改为定向探测(只点立即抽奖)")
+                if draw_step is not None:
+                    back = 7 - draw_step
+                    if back > 0:
+                        log(f"[全量扫描] 滚回抽奖赢金币所在位置(约第{draw_step + 1}屏, 下滚{back}屏)")
+                        for _ in range(back):
+                            adb_swipe_down()
+                            time.sleep(0.4)
+        else:
+            self._only_probe_draw = False
+            self._probe_draw_attempts = 0
+        log(f"[全量扫描] 结果: 可做={sorted(seen_available) or '无'} | 已完成={sorted(seen_done) or '无'} | 确认金币页={coin_page_seen}")
+        return coin_page_seen and not seen_available
 
-    if act != "PLAY_WAIT":
-        _play_wait_start = 0.0   # 页面已不是播放页, 计时复位
-    if act in ("CLICK", "SWIPE", "TOP", "PLAY_WAIT", "WAIT"):
-        _back_streak = 0         # 页面已有正常动作, BACK计数复位
-
-    remember_action(act, reason)   # 记录真实动作, 供下一轮AI判断是否原地重复
-
-    w = random.uniform(WAIT_MIN, WAIT_MAX)
-    log(f"[等待] {w:.1f}s")
-    time.sleep(w)
-    return act
-
-def full_scan():
-    """全量扫描: 回到金币页顶部, 逐屏下滑到底, 检查四个指定任务是否还有可做的.
-    只有确认在金币页且整页扫描都没发现可做任务时, 才返回 True(今日任务全部完成)"""
-    global _video_top_exhausted_until, _only_probe_draw
-    log("[全量扫描] 开始: 回到金币页顶部并逐屏扫描四个任务")
-    for _ in range(6):
-        adb_swipe_down()
-        time.sleep(0.4)
-    seen_available = set()
-    seen_done = set()
-    coin_page_seen = False
-    draw_step = None   # 抽奖赢金币"立即抽奖"出现在第几屏
-    for step in range(8):
-        try:
-            (ow, oh), b64 = capture_and_encode()
-            result = call_vlm(b64, mode="scan")
-        except Exception as e:
-            log(f"[全量扫描] 第{step+1}屏失败: {str(e)[:40]}")
-            break
-        if result.get("is_coin_page"):
-            coin_page_seen = True
-        states = []
-        for t in SCAN_TASKS:
-            st = str(result.get(t, "absent")).strip().lower()
-            # 看视频领金币板块只在页面顶部的前4屏; 底部"领金币"/听热歌/签到/金币抽奖格子不算它
-            if t == "看视频领金币" and step >= 4:
-                st = "absent"
-            states.append(f"{t}={st}")
-            if st == "available":
-                seen_available.add(t)
-                if t == "抽奖赢金币" and draw_step is None:
-                    draw_step = step
-            elif st == "done":
-                seen_done.add(t)
-        log(f"[全量扫描] 第{step+1}屏: " + "  ".join(states))
-        if step < 7:
-            adb_swipe_up()
-            time.sleep(0.6)
-    if tian_draw_exhausted():
-        seen_available.discard("抽奖赢金币")
-        seen_done.add("抽奖赢金币")
-    if video_top_exhausted():
-        seen_available.discard("看视频领金币")
-        seen_done.add("看视频领金币")
-    elif "看视频领金币" in seen_done and "看视频领金币" not in seen_available:
-        # 整页扫描里该板块只显示已完成/明日再来, 从未出现可点按钮 -> 确认为已用完
-        _video_top_exhausted_until = time.time() + 600
-        seen_done.add("看视频领金币")
-    if seen_available == {"抽奖赢金币"}:
-        _only_probe_draw = True
-        log("[全量扫描] 只剩抽奖赢金币待确认, 正常循环改为定向探测(只点立即抽奖)")
-        if draw_step is not None:
-            back = 7 - draw_step
-            if back > 0:
-                log(f"[全量扫描] 滚回抽奖赢金币所在位置(约第{draw_step+1}屏, 下滚{back}屏)")
-                for _ in range(back):
-                    adb_swipe_down()
-                    time.sleep(0.4)
-    else:
-        _only_probe_draw = False
-    log(f"[全量扫描] 结果: 可做={sorted(seen_available) or '无'} | 已完成={sorted(seen_done) or '无'} | 确认金币页={coin_page_seen}")
-    return coin_page_seen and not seen_available
-
-def main():
-    if not os.getenv("AGNES_API_KEY"):
-        log("!! .env 里没有 AGNES_API_KEY")
-        sys.exit(1)
-    if not Path(ADB).exists():
-        log(f"!! adb 路径不存在: {ADB}")
-        sys.exit(1)
-    global _last_had_click, _last_uia_pos, _last_uia_time, _uia_streak, _play_wait_start, _back_streak, _post_ad_round, _tian_draw_exhausted_until, _video_top_exhausted_until, _last_click_reason, _need_scan, _only_probe_draw
-    _last_had_click = False
-    _play_wait_start = 0.0
-    _back_streak = 0
-    _post_ad_round = False
-    _tian_draw_exhausted_until = 0.0
-    _video_top_exhausted_until = 0.0
-    _last_click_reason = ""
-    _need_scan = False
-    _only_probe_draw = False
-    _last_uia_pos = None      # 上一次硬编码点击的坐标(防卡死用)
-    _last_uia_time = 0.0      # 上一次硬编码点击的时间戳
-    _uia_streak = 0           # 同一按钮连续命中计数(>=2 即第3次 -> 下滑换任务)
-
-    # 广告状态机内连续WAIT计数(登录页/无入口页兜底BACK) — 仅main/ad_step作用域内使用, 用nonlocal传递
-    _ad_wait_streak = 0
-
-    # 支持命令行传轮数: python qqmusic_agent.py 5 (试跑5轮)
-    rounds = MAX_ROUNDS
-    if len(sys.argv) > 1:
-        try:
-            rounds = int(sys.argv[1])
-        except ValueError:
-            pass
-
-    try:
-        out = subprocess.run([ADB, "devices"], capture_output=True, text=True).stdout
-        log("设备状态:\n" + out.strip())
-        if "device\n" not in out and "\tdevice" not in out:
-            log("!! 没有检测到已连接的手机。请先完成下方手机设置再运行。")
-    except Exception as e:
-        log(f"!! adb 调用失败: {e}")
-        sys.exit(1)
-
-    n = 0
-    wait_streak = 0   # 连续WAIT计数, 连续3次强制BACK兜底
-    swipe_streak = 0  # 连续SWIPE计数, 连续6次滚回页面顶部
-    no_click = 0      # 连续没有点到任何任务的轮数, >=8 触发全量扫描
-
-    # ===== 广告流程状态机 (代码强制流转, 不靠模型猜状态) =====
-    # AD_IDLE=0 正常金币页 | AD_ENTRY=1 刚进广告页→点跳转按钮(了解详情/立即咨询)
-    # AD_WATCH=2 新页面(TransPortraitADActivity)等15秒 | AD_BACK=3 点弹窗右上角X回广告页
-    # AD_CLOSE=4 广告页→点右上角X关闭
-    AD_IDLE, AD_ENTRY, AD_WATCH, AD_BACK, AD_CLOSE = 0, 1, 2, 3, 4
-    ad_state = AD_IDLE
-    ad_watch_start = 0.0   # 进入AD_WATCH的时间戳
-    ad_close_streak = 0    # AD_CLOSE连续点X次数, >=2改BACK退出
-    AD_WATCH_SECONDS = 16  # 详情页最少浏览秒数(15秒+1余量)
-    AD_WATCH_MAX_SECONDS = 31  # 30秒视频等长广告: AI说还没播完可继续等, 上限31秒(防止提前关闭丢金币)
-
-    def ad_step(ow, oh):
+    # ---------- 广告状态机单步 ----------
+    def ad_step(self, ow, oh):
         """广告状态机单步执行, 返回状态(是否仍需继续广告流程)"""
-        nonlocal ad_state, ad_watch_start, ad_close_streak, _ad_wait_streak
-        if ad_state == AD_IDLE:
+        if self.ad_state == 0:   # AD_IDLE
             return False
-        if ad_state == AD_ENTRY:
-            # 广告页: 让模型定位"了解详情/点击查看/进入详情页"按钮
+        if self.ad_state == 1:   # AD_ENTRY
             try:
                 (w2, h2), b64 = capture_and_encode()
-                action = call_vlm(b64, mode="ad")
+                action = self.call_vlm(b64, mode="ad")
                 act = action.get("action", "WAIT")
                 if act == "CLICK":
                     rx = float(action.get("x", 500)); ry = float(action.get("y", 500))
                     x = int(rx / 1000 * w2); y = int(ry / 1000 * h2)
                     x += random.randint(-OFFSET, OFFSET); y += random.randint(-OFFSET, OFFSET)
-                    log(f"[广告-点了解详情] 坐标({x},{y}) reason={action.get('reason','')}")
+                    log(f"[广告-点跳转] 坐标({x},{y}) reason={action.get('reason', '')}")
                     adb_tap(x, y)
-                    ad_state = AD_WATCH
-                    ad_watch_start = time.time()
-                    _ad_wait_streak = 0
+                    time.sleep(1.5)
+                    if is_ad_activity() or is_in_qqmusic():
+                        self.ad_state = 2   # AD_WATCH
+                        self.ad_watch_start = time.time()
+                        self._ad_wait_streak = 0
+                        log("[广告-已进入广告/详情页, 开始计时]")
+                    else:
+                        log("[广告-跳转外部App] 放弃本次广告, 复位等待恢复")
+                        self.ad_state = 0
+                        self._ad_wait_streak = 0
                     return True
                 elif act == "CLOSE":
-                    # 模型看到"恭喜已获得奖励" → 直接进入关闭
-                    log(f"[广告-已看完] {action.get('reason','')}")
-                    ad_state = AD_CLOSE
-                    _ad_wait_streak = 0
+                    log(f"[广告-已看完] {action.get('reason', '')}")
+                    self.ad_state = 4   # AD_CLOSE
+                    self._ad_wait_streak = 0
                     return True
                 elif act == "BACK":
-                    # 登录/注册表单页: 无广告计时入口, 直接返回(不用等)
-                    log(f"[广告-登录页] {action.get('reason','')} —— 直接BACK返回")
+                    log(f"[广告-登录页] {action.get('reason', '')} —— 直接BACK返回")
                     adb_back()
-                    _ad_wait_streak = 0
+                    self._ad_wait_streak = 0
                     time.sleep(random.uniform(2, 3))
-                    ad_state = AD_BACK
+                    self.ad_state = 3   # AD_BACK
                     return True
                 else:
-                    # WAIT: 连续2次仍无入口(登录页/无意义页) -> 强制BACK, 避免空等
-                    _ad_wait_streak += 1
-                    log(f"[广告-等待] {action.get('reason','')} —— 再等几秒 ({_ad_wait_streak}/2)")
-                    if _ad_wait_streak >= 2:
+                    self._ad_wait_streak += 1
+                    log(f"[广告-等待] {action.get('reason', '')} —— 再等几秒 ({self._ad_wait_streak}/2)")
+                    if self._ad_wait_streak >= 2:
                         log("[广告-等待超限] 连续2次无跳转入口, 强制BACK返回")
                         adb_back()
-                        _ad_wait_streak = 0
+                        self._ad_wait_streak = 0
                         time.sleep(random.uniform(2, 3))
-                        ad_state = AD_BACK
+                        self.ad_state = 3
                         return True
                     time.sleep(random.uniform(3, 5))
                     return True
@@ -910,67 +957,57 @@ def main():
                 log(f"[广告-入口异常] {e}")
                 time.sleep(3)
                 return True
-        if ad_state == AD_WATCH:
-            # 详情页/新页面: 强制等待满15秒(倒计时数字会卡住不走, 不能等它归零)
-            elapsed = time.time() - ad_watch_start
+        if self.ad_state == 2:   # AD_WATCH
+            elapsed = time.time() - self.ad_watch_start
             if elapsed < AD_WATCH_SECONDS:
                 remain = max(1, AD_WATCH_SECONDS - elapsed)
                 log(f"[广告-详情页浏览] 已看{elapsed:.0f}s, 还需{remain:.0f}s")
                 time.sleep(min(remain, random.uniform(3, 5)))
                 return True
-            # 等满后: 先让模型看当前页面(可能已自动变"恭喜已获得奖励", 也可能还弹着咨询窗/H5页)
             try:
                 (w3, h3), b64 = capture_and_encode()
-                action = call_vlm(b64, mode="ad")
+                action = self.call_vlm(b64, mode="ad")
                 act = action.get("action", "WAIT")
             except Exception:
                 act = "WAIT"
             if act == "CLOSE":
-                log(f"[广告-已看完] {action.get('reason','')}")
-                ad_state = AD_CLOSE
+                log(f"[广告-已看完] {action.get('reason', '')}")
+                self.ad_state = 4   # AD_CLOSE
             elif act == "BACK":
-                # 详情页竟是登录/注册页(浏览没意义): 直接BACK返回, 不再双路径
-                log(f"[广告-详情页登录页] {action.get('reason','')} —— 直接BACK返回")
+                log(f"[广告-详情页登录页] {action.get('reason', '')} —— 直接BACK返回")
                 adb_back()
                 time.sleep(2)
-                ad_state = AD_BACK
+                self.ad_state = 3   # AD_BACK
             elif act == "WAIT" and elapsed < AD_WATCH_MAX_SECONDS:
-                # 30秒视频/长广告还没播完(AI说看不清/仍在播放): 继续等, 不能16秒就关掉丢金币
-                # AI调用本身已耗时10-20s, 这里只短暂缓冲, 下一轮马上复查
                 log(f"[广告-视频未看完] 已等{elapsed:.0f}s, 继续等待(上限{AD_WATCH_MAX_SECONDS}s)")
                 time.sleep(random.uniform(1, 2))
                 return True
             else:
-                # 双路径退出: ①H5页面(如保险登录页)可BACK返回 ②咨询弹窗可点弹窗右上角X
                 log("[广告-详情页看完] 先BACK返回(处理H5页), 再点弹窗右上角X(处理弹窗)")
                 adb_back()
                 time.sleep(2)
                 adb_tap(int(935 / 1000 * ow), int(622 / 1000 * oh))
-                ad_state = AD_BACK
+                self.ad_state = 3   # AD_BACK
             time.sleep(2)
             return True
-        if ad_state == AD_BACK:
-            # 已点弹窗X/BACK, 应回到广告页(显示"恭喜已获得奖励") → 交给AD_CLOSE由AI定位关闭按钮
-            # (不同广告关闭按钮位置不同, 固定坐标(999,256)常点空, 纯AI判断更稳)
+        if self.ad_state == 3:   # AD_BACK
             if is_ad_activity():
                 log("[广告-回广告页] 交给AI定位关闭按钮")
-                ad_state = AD_CLOSE
+                self.ad_state = 4   # AD_CLOSE
             else:
                 log("[广告-BACK] 已离开广告Activity, 回金币页")
-                ad_state = AD_IDLE
+                self.ad_state = 0   # AD_IDLE
             time.sleep(random.uniform(3, 5))
             return True
-        if ad_state == AD_CLOSE:
-            # 点过关闭按钮, 确认是否已退出广告
+        if self.ad_state == 4:   # AD_CLOSE
             if not is_ad_activity():
                 log("[广告-关闭完成] 已回金币页")
-                ad_state = AD_IDLE
+                self.ad_state = 0
             else:
-                # 仍判定在广告Activity: 先用AI视觉定位关闭按钮(不同广告X/退出按钮位置不同, 固定坐标常点空)
-                if ad_close_streak == 0:
+                if self.ad_close_streak == 0:
                     try:
                         (ow_c, oh_c), b64_c = capture_and_encode()
-                        close_action = call_vlm(b64_c, mode="close")
+                        close_action = self.call_vlm(b64_c, mode="close")
                         if close_action.get("action") == "CLICK":
                             try:
                                 rx = float(close_action.get("x", 500))
@@ -979,130 +1016,256 @@ def main():
                                 rx, ry = 500, 500
                             x = int(rx / 1000 * ow_c) + random.randint(-OFFSET, OFFSET)
                             y = int(ry / 1000 * oh_c) + random.randint(-OFFSET, OFFSET)
-                            log(f"[广告-关闭按钮AI定位] 坐标({x},{y}) reason={close_action.get('reason','')}")
+                            log(f"[广告-关闭按钮AI定位] 坐标({x},{y}) reason={close_action.get('reason', '')}")
                             adb_tap(x, y)
                         else:
-                            # AI没找到关闭按钮: 大概率是H5页/登录页(无原生X), 直接BACK比固定X更快更稳
                             log(f"[广告-关闭AI未给出按钮] 直接BACK退出(H5页无原生X)")
                             adb_back()
                     except Exception as e:
                         log(f"[广告-关闭AI失败] 直接BACK退出 ({str(e)[:30]})")
                         adb_back()
-                    ad_close_streak += 1
+                    self.ad_close_streak += 1
                     time.sleep(random.uniform(3, 5))
-                elif ad_close_streak == 1:
+                elif self.ad_close_streak == 1:
                     log("[广告-仍在广告页] BACK后再试固定右上角X")
                     tap_close(ow, oh)
-                    ad_close_streak += 1
+                    self.ad_close_streak += 1
                     time.sleep(random.uniform(3, 5))
                 else:
-                    # 仍判定在广告Activity且右上角X无效 → 可能是H5页/弹窗残留/未点立即浏览的确认弹窗
                     log("[广告-仍在广告页且关闭无效] 连续关闭失败, 改BACK退出")
                     adb_back()
-                    ad_close_streak = 0
+                    self.ad_close_streak = 0
                     time.sleep(random.uniform(3, 5))
-                    # BACK后可能回到广告页(确认弹窗/广告本体): 交给AD_ENTRY让模型重新判断
-                    # (可能是"点击立即浏览"没点、或"恭喜已获得奖励"该点X, 不能继续死点X)
-                    ad_state = AD_ENTRY
+                    self.ad_state = 1   # AD_ENTRY 重新判断
             return True
         return False
 
-    # 启动先做一次全量扫描: 四个任务全部完成则直接退出; 否则进入正常刷任务
-    if is_in_qqmusic() and not is_ad_activity():
-        if full_scan():
-            log("[全量扫描] 今日四个任务全部完成, 退出")
-            return
-    else:
-        log("[全量扫描] 当前不在金币页或处于广告页, 跳过启动扫描")
+    # ---------- 主循环 ----------
+    def run(self, rounds=None):
+        if not os.getenv("AGNES_API_KEY"):
+            log("!! .env 里没有 AGNES_API_KEY")
+            sys.exit(1)
+        if not Path(ADB).exists():
+            log(f"!! adb 路径不存在: {ADB}")
+            sys.exit(1)
+        # 重置本次运行状态
+        self._last_had_click = False
+        self._play_wait_start = 0.0
+        self._back_streak = 0
+        self._post_ad_round = False
+        self._tian_draw_exhausted_until = 0.0
+        self._video_top_exhausted_until = 0.0
+        self._last_click_reason = ""
+        self._need_scan = False
+        self._only_probe_draw = False
+        self._probe_draw_attempts = 0
+        self._last_uia_pos = None
+        self._last_uia_time = 0.0
+        self._uia_streak = 0
+        self._current_round = 0
+        self._last_heartbeat = time.time()
+        self._vlm_calls = 0
+        self.ad_state = 0
+        self.ad_watch_start = 0.0
+        self.ad_close_streak = 0
+        self._ad_wait_streak = 0
 
-    while n < rounds:
-        n += 1
-        log(f"===== 第 {n}/{rounds} 轮 =====")
+        AD_IDLE, AD_ENTRY, AD_WATCH, AD_BACK, AD_CLOSE = 0, 1, 2, 3, 4
 
-        # 兜底0(最高优先): 误点了跳转第三方App的任务(京东/淘宝等), 焦点已离开QQ音乐 → 强制返回
-        if not is_in_qqmusic() and not is_ad_activity():
-            log("[兜底0] 误跳第三方App, 逐次BACK回QQ音乐(不再一次连按5次, 避免退过头到首页)")
-            for i in range(5):
+        rounds = rounds if rounds is not None else MAX_ROUNDS
+        if len(sys.argv) > 1:
+            try:
+                rounds = int(sys.argv[1])
+            except ValueError:
+                pass
+
+        try:
+            out = subprocess.run([ADB, "devices"], capture_output=True, text=True, timeout=10).stdout
+            log("设备状态:\n" + out.strip())
+            if "device\n" not in out and "\tdevice" not in out:
+                log("!! 没有检测到已连接的手机。请先完成下方手机设置再运行。")
+                sys.exit(1)
+        except Exception as e:
+            log(f"!! adb 调用失败: {e}")
+            sys.exit(1)
+
+        self.start_watchdog()
+
+        n = 0
+        wait_streak = 0
+        swipe_streak = 0
+        no_click = 0
+
+        log("[启动] 直接进入刷任务循环(终局验证扫描在判定全部完成时进行)")
+
+        while n < rounds:
+            n += 1
+            self._current_round = n
+            self.heartbeat()
+            self.watchdog_check_pause()
+            log(f"===== 第 {n}/{rounds} 轮 =====")
+
+            # 兜底0(最高优先): 误跳外部App(浏览器/应用商店/电商App等), 焦点已离开QQ音乐 → 强制返回
+            ext = is_external_app()
+            if ext or (not is_in_qqmusic() and not is_ad_activity()):
+                log(f"[兜底0] 检测到离开QQ音乐(外部App={ext or '未知'}), 尝试逐次BACK回到QQ音乐/广告页")
+                recovered = False
+                for i in range(8):
+                    adb_back()
+                    time.sleep(1.0)
+                    if is_in_qqmusic():
+                        log(f"[兜底0] 第{i + 1}次BACK已回到QQ音乐")
+                        recovered = True
+                        break
+                    if is_ad_activity():
+                        log(f"[兜底0] 第{i + 1}次BACK回到广告页, 交给状态机退出")
+                        self.ad_state = AD_CLOSE
+                        recovered = True
+                        break
+                if not recovered:
+                    log("[兜底0] BACK无法返回, 尝试 monkey 重新拉起QQ音乐")
+                    try:
+                        subprocess.run([ADB, "shell", "monkey", "-p", "com.tencent.qqmusic",
+                                        "-c", "android.intent.category.LAUNCHER", "1"],
+                                       capture_output=True, timeout=10)
+                    except Exception as e:
+                        log(f"[兜底0] monkey失败: {str(e)[:40]}")
+                    time.sleep(3)
+                self.ad_state = AD_IDLE
+                self._last_uia_pos = None
+                self._uia_streak = 0
+                self._play_wait_start = 0.0
+                self._ad_wait_streak = 0
+                time.sleep(random.uniform(3, 6))
+                continue
+
+            # 广告状态机优先
+            if is_ad_activity():
+                no_click = 0
+                if self.ad_state == AD_IDLE:
+                    self.ad_state = AD_ENTRY
+                self.ad_step(1080, 2400)
+                self.heartbeat()
+                self.watchdog_check_pause()
+                time.sleep(SHOT_INTERVAL)
+                continue
+
+            # 不在广告Activity但状态机未复位 → 视为已回金币页
+            if self.ad_state != AD_IDLE:
+                log("[状态机] 已离开广告Activity, 复位")
+                self.ad_state = AD_IDLE
+                self._ad_wait_streak = 0
+                self._last_uia_pos = None
+                self._uia_streak = 0
+                self._post_ad_round = True
+
+            # 兜底1: 连续多次WAIT
+            if wait_streak >= 3:
+                log("[兜底] 连续3次无动作, 强制返回上一页")
                 adb_back()
-                time.sleep(1.5)
-                if is_in_qqmusic():
-                    log(f"[兜底0] 第{i+1}次BACK已回到QQ音乐, 停止返回(尽量保留金币页)")
-                    break
-            ad_state = AD_IDLE
-            _last_uia_pos = None; _uia_streak = 0   # 重置防卡死(页面已变)
-            _play_wait_start = 0.0                  # 页面已变, 播放计时复位
-            time.sleep(random.uniform(3, 6))
-            continue
+                wait_streak = 0
+                time.sleep(random.uniform(3, 6))
+            # 兜底2: 连续下滑到底
+            if swipe_streak >= 6:
+                log("[兜底] 连续6次下滑到底, 采样并滚回金币页顶部重新扫描")
+                save_sample(n, "连续6次下滑到底")
+                for _ in range(6):
+                    adb_swipe_down()
+                    time.sleep(0.8)
+                swipe_streak = 0
+                time.sleep(random.uniform(2, 4))
+            act = self.run_once()
+            self.watchdog_check_pause()
+            if act == "WAIT":
+                wait_streak += 1
+            else:
+                wait_streak = 0
+            if act == "SWIPE":
+                swipe_streak += 1
+            else:
+                swipe_streak = 0
 
-        # 广告状态机优先: 一旦进入广告流程, 由状态机接管直到回金币页
-        if is_ad_activity():
-            no_click = 0   # 广告流程有推进, 重置"无点击"计数
-            if ad_state == AD_IDLE:
-                ad_state = AD_ENTRY
-            ad_step(1080, 2400)
+            # 刚确认某个任务已用完 -> 立即全量扫描一次
+            if self._need_scan and not is_ad_activity():
+                self._need_scan = False
+                if self.full_scan():
+                    log("[全量扫描] 今日四个任务全部完成, 退出")
+                    self._finish(rounds)
+                    return
+                no_click = 0
+                wait_streak = 0
+                swipe_streak = 0
+
+            if act == "CLICK":
+                no_click = 0
+            elif act in ("SWIPE", "TOP", "BACK", "PLAY_WAIT"):
+                no_click += 1
+            else:
+                no_click = 0
+            if no_click >= 8:
+                if self.full_scan():
+                    log("[全量扫描] 今日四个任务全部完成, 退出")
+                    self._finish(rounds)
+                    return
+                no_click = 0
+                wait_streak = 0
+                swipe_streak = 0
+
             time.sleep(SHOT_INTERVAL)
-            continue
+        log("到达轮数上限, 结束。")
+        self._return_to_qqmusic()
+        self._finish(rounds)
 
-        # 不在广告Activity但状态机未复位 → 视为已回金币页
-        if ad_state != AD_IDLE:
-            log("[状态机] 已离开广告Activity, 复位")
-            ad_state = AD_IDLE
-            _ad_wait_streak = 0   # 重置广告WAIT计数(页面已变)
-            _last_uia_pos = None; _uia_streak = 0   # 重置防卡死(页面已变)
-            _post_ad_round = True # 下一轮若看到播放页, 判定为广告残留页直接BACK
-
-        # 兜底1: 连续多次WAIT说明可能卡在某个页面, 强制返回一次
-        if wait_streak >= 3:
-            log("[兜底] 连续3次无动作, 强制返回上一页")
+    def _return_to_qqmusic(self, max_back=12):
+        """轮数到上限/收尾时, 主动把焦点拉回QQ音乐(金币页), 避免停在第三方App/广告页。
+        广告页/H5常拦截BACK键, 故除BACK外还试固定右上角X关闭; 仍失败则force-stop当前前台包并重拉QQ音乐。"""
+        log("[收尾] 主动兜底回到QQ音乐...")
+        for _ in range(max_back):
+            if is_in_qqmusic() and not is_ad_activity():
+                log("[收尾] 已回到QQ音乐任务页")
+                return
+            # 广告页: 先试固定右上角X关闭, 再BACK
+            if is_ad_activity():
+                try:
+                    screencap(SCREEN_PATH)
+                    ow, oh = Image.open(SCREEN_PATH).size
+                except Exception:
+                    ow, oh = 1080, 2400
+                tap_close(ow, oh)
+                time.sleep(1.0)
             adb_back()
-            wait_streak = 0
-            time.sleep(random.uniform(3, 6))
-        # 兜底2: 连续下滑到底 → 采样 + 滚回页面顶部重新扫描(不用BACK, 避免退到首页/我的)
-        if swipe_streak >= 6:
-            log("[兜底] 连续6次下滑到底, 采样并滚回金币页顶部重新扫描")
-            save_sample(n, "连续6次下滑到底")
-            for _ in range(6):
-                adb_swipe_down()
-                time.sleep(0.8)
-            swipe_streak = 0
-            time.sleep(random.uniform(2, 4))
-        act = run_once()
-        if act == "WAIT":
-            wait_streak += 1
+            time.sleep(1.0)
+        # 收尾仍未回到QQ音乐任务页 -> 强制结束当前前台包 + 重拉QQ音乐(可确定性逃出BACK陷阱)
+        pkg = current_focus_package()
+        if is_ad_activity() or (pkg and pkg != "com.tencent.qqmusic"):
+            log(f"[收尾] 常规退出失败(当前包={pkg}), force-stop 并重拉QQ音乐")
+            try:
+                if pkg and pkg != "com.tencent.qqmusic":
+                    subprocess.run([ADB, "shell", "am", "force-stop", pkg], capture_output=True, timeout=10)
+            except Exception:
+                pass
+            time.sleep(1)
+            try:
+                subprocess.run([ADB, "shell", "am", "force-stop", "com.tencent.qqmusic"], capture_output=True, timeout=10)
+            except Exception:
+                pass
+            time.sleep(2)
+            try:
+                subprocess.run([ADB, "shell", "monkey", "-p", "com.tencent.qqmusic",
+                                "-c", "android.intent.category.LAUNCHER", "1"],
+                               capture_output=True, timeout=10)
+            except Exception as e:
+                log(f"[收尾] monkey失败: {str(e)[:40]}")
+            time.sleep(3)
+        # 最终状态日志
+        if is_in_qqmusic():
+            log("[收尾] 已回到QQ音乐(可能为首页, 非金币中心, 需手动进金币中心)")
         else:
-            wait_streak = 0
-        if act == "SWIPE":
-            swipe_streak += 1
-        else:
-            swipe_streak = 0
+            log("[收尾] 警告: 仍未回到QQ音乐, 请手动处理")
 
-        # 刚确认某个任务已用完 -> 立即全量扫描一次; 四个任务都没有可做的就退出
-        if _need_scan and not is_ad_activity():
-            _need_scan = False
-            if full_scan():
-                log("[全量扫描] 今日四个任务全部完成, 退出")
-                return
-            no_click = 0
-            wait_streak = 0
-            swipe_streak = 0
+    def _finish(self, rounds):
+        log(f"[统计] 本轮共调用视觉模型 {self._vlm_calls} 次 (轮数上限={rounds})")
 
-        # 连续多轮没点到任何任务 -> 全量扫描一次; 四个任务都没有可做的就退出
-        if act == "CLICK":
-            no_click = 0
-        elif act in ("SWIPE", "TOP", "BACK", "WAIT", "PLAY_WAIT"):
-            no_click += 1
-        else:
-            no_click = 0
-        if no_click >= 8:
-            if full_scan():
-                log("[全量扫描] 今日四个任务全部完成, 退出")
-                return
-            no_click = 0
-            wait_streak = 0
-            swipe_streak = 0
-
-        time.sleep(SHOT_INTERVAL)
-    log("到达轮数上限, 结束。")
 
 if __name__ == "__main__":
-    main()
+    QQCoinAgent().run()
