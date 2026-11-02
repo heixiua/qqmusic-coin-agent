@@ -63,6 +63,8 @@ AD_WATCH_MAX_SECONDS = 31   # [已停用] 旧版30秒视频继续等待上限; �
 AD_DOOR_VIDEO_X_REL, AD_DOOR_VIDEO_Y_REL = 500, 600
 # 门页底部 CTA("点击浏览15秒"/"立即下载")位置: 实测在屏高约 87% 处(dump 读不到文字, 只能按坐标)
 AD_DOOR_CTA_X_REL, AD_DOOR_CTA_Y_REL = 500, 870
+# "我的"页右上角的"xxx 领现金"入口: 自绘控件, dump 无文字节点, 只能按坐标(实测约 82.5%, 15.5%)
+AD_LIQIAN_X_REL, AD_LIQIAN_Y_REL = 825, 155
 EXTERNAL_INCENTIVE_WAIT = 5 # 激励"浏览5秒"跳商店/浏览器后, 至少等5秒再BACK(否则金币不到账)
 OFFSET = 12               # 点击坐标随机偏移(千分比坐标下偏移1.2%)
 SKIP_PROB = 0.08          # 随机跳过本轮概率(反风控)
@@ -1319,15 +1321,23 @@ class QQCoinAgent:
         if self._tap_any(("我的",), exact=True,
                          exclude=("我的收藏", "我的音乐", "我的听歌", "我的关注",
                                   "我的订单", "我的钱包", "我的客服", "我的动态")):
-            time.sleep(1.5)
-            # 步骤2: '领现金'
-            if self._tap_any(("领现金",)):
+            time.sleep(2.0)
+            # 步骤2: '领现金' —— 实测这是**自绘控件, dump 里没有文字节点**, 文本匹配永远落空,
+            # 于是旧版只能靠VLM反复点"我的"卡住。这里补一条固定坐标: 我的页右上角"xxx 领现金"。
+            hit_lq = self._tap_any(("领现金",))
+            if hit_lq:
                 time.sleep(2.0)
-                # 步骤3: 领现金页内的金币中心入口
-                if self._tap_any(("看广告赚金币", "金币中心", "做任务赚金币")):
-                    time.sleep(2.5)
-                    if self._on_coin_center():
-                        return True
+            else:
+                log(f"[导航] '领现金'无文字节点(自绘控件), 按固定坐标({AD_LIQIAN_X_REL},{AD_LIQIAN_Y_REL})点")
+                adb_tap(int(AD_LIQIAN_X_REL / 1000 * 1080), int(AD_LIQIAN_Y_REL / 1000 * 2400))
+                time.sleep(2.5)
+            if self._on_coin_center():
+                return True
+            # 步骤3: 领现金页内的金币中心入口
+            if self._tap_any(("看广告赚金币", "金币中心", "做任务赚金币")):
+                time.sleep(2.5)
+                if self._on_coin_center():
+                    return True
         # 兜底: VLM 导航
         try:
             (ow, oh), b64 = capture_and_encode()
@@ -1804,24 +1814,33 @@ class QQCoinAgent:
         self._return_to_qqmusic()
         self._finish(rounds)
 
-    def _return_to_qqmusic(self, max_back=2):
-        """轮数到上限/收尾时, 主动把焦点拉回QQ音乐金币中心, 避免停在第三方App/广告页。
-        广告页/H5常拦截BACK键且dump很慢(8s), 故最多试2轮(放弃奖励/退出/关闭文字 + 角标X + BACK),
-        仍失败立即 force-stop 当前前台包并重拉QQ音乐, 重拉后自动导航进入金币中心。
-        (force-stop 是确定性逃出, 不再像旧版死磕12轮BACK导致几分钟卡死)"""
+    def _return_to_qqmusic(self, max_back=4):
+        """收尾: 把画面拉回金币中心。三个关键点(都是实测踩出来的):
+        1) 广告详情页是 QQ音乐内部的 webview, is_ad_activity() 会一直为真,
+           所以**不能用它判断"是否已经退出广告"**(旧版就这样死磕角标X直到 force-stop);
+           真正的成功判据只能是"是否真的在金币中心"(_on_coin_center)。
+        2) webview 栈是 详情页 → 门页 → 金币中心, 逐层 BACK 最省事。
+        3) 已经在 QQ音乐里但不在金币中心时**绝不要 force-stop**: 重拉必然落到首页并弹开屏广告,
+           看起来就像"跑完回首页"; 这种情况直接导航 我的→领现金→金币中心。"""
         log("[收尾] 主动兜底回到QQ音乐(金币中心)...")
-        for _ in range(max_back):
-            self.heartbeat()   # 收尾也要心跳, 否则watchdog误判"93s无进展"卡死
-            if is_in_qqmusic() and not is_ad_activity():
-                # 可能停在首页/其他子页/记录页, 确保进入金币中心
-                self._leave_ledger()
-                if not self._on_coin_center():
-                    self.goto_coin_center()
-                if self._on_coin_center():
-                    log("[收尾] 已回到QQ音乐金币中心")
-                    return
-            # 广告页: 先试关闭文字(放弃奖励/退出/返回/关闭), 再试固定右上角X; 每次点完立即复查, 不盲连点
-            if is_ad_activity():
+        for i in range(max_back):
+            self.heartbeat()   # 收尾也要心跳, 否则 watchdog 误判"93s无进展"卡死
+            if not is_in_qqmusic():
+                adb_back()
+                time.sleep(1.0)
+                continue
+            if self._leave_ledger():
+                continue
+            if self._on_coin_center():
+                log("[收尾] 已在金币中心")
+                self._watchdog_tripped = False
+                return
+            # 已经退到首页(底部有 推荐/刷歌/乐馆): 再BACK只会原地打转, 直接改导航
+            if "乐馆" in _LAST_DUMP_XML and "刷歌" in _LAST_DUMP_XML:
+                log("[收尾] 已退到首页, 停止BACK, 改导航进金币中心")
+                break
+            if i == 0 and is_ad_activity():
+                # 第一轮按"关广告"思路: 先试文字(放弃奖励/跳过/退出/关闭), 再试智能关闭
                 hit = tap_text_priority(AD_CLOSE_TEXT_SPECS)
                 if hit:
                     log(f"[收尾] 已点'{hit}'尝试关闭广告")
@@ -1833,39 +1852,61 @@ class QQCoinAgent:
                 except Exception:
                     ow, oh = 1080, 2400
                 if tap_close_smart(ow, oh):
-                    log("[收尾] 智能关闭命中, 收手(不补点左上角, 否则会误点金币中心卡片)")
+                    log("[收尾] 智能关闭命中, 继续复查是否到金币中心")
                     continue
-                tap_close_left(ow, oh)     # 左上角X/返回箭头
-                time.sleep(0.8)
+            log(f"[收尾] BACK 退一层({i + 1}/{max_back})")
             adb_back()
-            time.sleep(0.8)
-        # 收尾仍未回到目标 -> 强制结束当前前台包 + 重拉QQ音乐(可确定性逃出BACK陷阱)
+            time.sleep(1.0)
+
+        # ① 仍在 QQ音乐内 → 直接导航, 不重拉(避免落回首页 + 开屏广告)
+        if is_in_qqmusic():
+            log("[收尾] 仍在QQ音乐内但不在金币中心, 直接导航(不重拉)")
+            for _ in range(2):
+                self._leave_ledger()
+                self.goto_coin_center()
+                if self._on_coin_center():
+                    log("[收尾] 已回到QQ音乐金币中心")
+                    self._watchdog_tripped = False
+                    return
+                adb_back()
+                time.sleep(1.0)
+            log("[收尾] 警告: 仍未进入金币中心, 请手动处理")
+            self._watchdog_tripped = False
+            return
+
+        # ② 还在外部App(应用商店/浏览器/电商) → force-stop 外部包 + 重拉QQ音乐
         pkg = current_focus_package()
-        if is_ad_activity() or (pkg and pkg != "com.tencent.qqmusic"):
-            log(f"[收尾] 常规退出失败(当前包={pkg}), force-stop 并重拉QQ音乐")
-            try:
-                if pkg and pkg != "com.tencent.qqmusic":
-                    subprocess.run([ADB, "shell", "am", "force-stop", pkg], capture_output=True, timeout=10)
-            except Exception:
-                pass
-            time.sleep(1)
-            try:
-                subprocess.run([ADB, "shell", "am", "force-stop", "com.tencent.qqmusic"], capture_output=True, timeout=10)
-            except Exception:
-                pass
-            time.sleep(2)
-            try:
-                subprocess.run([ADB, "shell", "monkey", "-p", "com.tencent.qqmusic",
-                                "-c", "android.intent.category.LAUNCHER", "1"],
-                               capture_output=True, timeout=10)
-            except Exception as e:
-                log(f"[收尾] monkey失败: {str(e)[:40]}")
-            time.sleep(3)
-        # 重拉后确保进入金币中心
+        log(f"[收尾] 常规退出失败(当前包={pkg}), force-stop 并重拉QQ音乐")
+        try:
+            if pkg and pkg != "com.tencent.qqmusic":
+                subprocess.run([ADB, "shell", "am", "force-stop", pkg], capture_output=True, timeout=10)
+        except Exception:
+            pass
+        time.sleep(1)
+        try:
+            subprocess.run([ADB, "shell", "am", "force-stop", "com.tencent.qqmusic"],
+                           capture_output=True, timeout=10)
+        except Exception:
+            pass
+        time.sleep(2)
+        try:
+            subprocess.run([ADB, "shell", "monkey", "-p", "com.tencent.qqmusic",
+                            "-c", "android.intent.category.LAUNCHER", "1"],
+                           capture_output=True, timeout=10)
+        except Exception as e:
+            log(f"[收尾] monkey失败: {str(e)[:40]}")
+        time.sleep(3)
+        # 重拉后会先弹开屏广告: 有"跳过"就点, 再导航
         self.heartbeat()
-        if not self._on_coin_center():
+        for _ in range(2):
+            tap_text_priority([("跳过", (), False, True)])
+            time.sleep(1.0)
+            if self._on_coin_center():
+                break
             self.goto_coin_center()
-        self._watchdog_tripped = False   # 收尾完成, 清除收尾期间可能触发的watchdog标记, 避免后续误暂停
+            if self._on_coin_center():
+                break
+        self._watchdog_tripped = False
         if self._on_coin_center():
             log("[收尾] 已回到QQ音乐金币中心")
         else:
