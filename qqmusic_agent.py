@@ -154,9 +154,30 @@ RESCUE_PROMPT = (
     "只点关闭/退出按钮, 严禁点了解详情/立即咨询/下载等广告跳转按钮。\n"
     "4. 歌曲播放页/视频播放页(专辑封面、播放进度条、暂停键、歌曲名): "
     "{\"action\":\"PLAY_WAIT\",\"reason\":\"播放页,听满15秒再返回\"}。\n"
-    "5. 登录/注册/商品页/第三方App/空白页/其他无法判断: "
+    "5. QQ音乐首页(顶部推荐/刷歌/乐馆标签、底部导航栏): 点底部【我的】→ "
+    "{\"action\":\"CLICK\",\"x\":<0~1000>,\"y\":<0~1000>,\"reason\":\"点底部我的, 导航回金币页\"}。\n"
+    "6. 我的个人中心页(头像/昵称/我的资产): 找【领现金】入口→ "
+    "{\"action\":\"CLICK\",\"x\":<0~1000>,\"y\":<0~1000>,\"reason\":\"点领现金, 导航回金币页\"}。\n"
+    "7. 登录/注册/商品页/第三方App/空白页/其他无法判断: "
     "{\"action\":\"BACK\",\"reason\":\"无法利用的页面, 返回一次\"}。\n"
     "只输出JSON。"
+)
+
+# 导航回金币页prompt: 误退到首页/我的时, 让AI一步步点回金币狂欢节(坐标仍由AI看截图给出, 不硬编码)
+NAV_PROMPT = (
+    "你是QQ音乐页面导航Agent。脚本当前离开了【金币狂欢节】任务页, 需要一步步导航回去。"
+    "分析截图, 只输出一个JSON对象, 不要多余文字。\n"
+    "1. 已经是金币狂欢节/赚金币任务页(有'金币狂欢节/赚金币/看视频领金币/立即抽奖'等字样): "
+    "{\"action\":\"NONE\",\"reason\":\"已到金币页\"}\n"
+    "2. QQ音乐首页(顶部有推荐/刷歌/乐馆/听书标签, 底部有首页/视频/刷歌/星光/我的导航栏): "
+    "点底部【我的】→ {\"action\":\"CLICK\",\"x\":<0~1000>,\"y\":<0~1000>,\"reason\":\"点底部我的\"}\n"
+    "3. 我的个人中心页(有头像/昵称/我的资产/设置等): 找【领现金】入口→ "
+    "{\"action\":\"CLICK\",\"x\":<0~1000>,\"y\":<0~1000>,\"reason\":\"点领现金\"}; 看不到就 "
+    "{\"action\":\"SWIPE\",\"reason\":\"下滑找领现金\"}\n"
+    "4. 领现金/金币中心页(有领现金/金币/现金提现等): 找【金币狂欢节/赚金币/金币任务】入口→ "
+    "{\"action\":\"CLICK\",\"x\":<0~1000>,\"y\":<0~1000>,\"reason\":\"进入金币狂欢节\"}\n"
+    "5. 其他页面(歌曲播放页/登录页/加载页/商品页): {\"action\":\"BACK\",\"reason\":\"不属于导航链路, 返回一次\"}\n"
+    "严禁点击: 活动任务区的下载/打开/分享/收藏/关注类任务、广告按钮。只输出JSON。"
 )
 
 def log(msg):
@@ -278,7 +299,8 @@ def call_vlm(img_b64, mode="normal"):
     last_err = None
     sys_prompt = (AD_ENTRY_PROMPT if mode == "ad" else
                   AD_CLOSE_PROMPT if mode == "close" else
-                  RESCUE_PROMPT if mode == "rescue" else SYSTEM_PROMPT)
+                  RESCUE_PROMPT if mode == "rescue" else
+                  NAV_PROMPT if mode == "nav" else SYSTEM_PROMPT)
     for p in VLM_PROVIDERS:
         api_key = os.getenv(p["api_key_env"])
         if not api_key:
@@ -554,14 +576,41 @@ def run_once():
         log(f"[播放页:{provider}] reason={reason}")
         act = play_wait_then_back(reason)
     elif act == "BACK":
-        _back_streak += 1
-        if _back_streak >= 2:
-            # 连续BACK无效: 说明已经离开金币页(我的/首页), 再BACK只会退出App; 暂停等用户手动回金币页
-            log(f"[离开金币页] 连续{_back_streak}次BACK无效, 暂停30秒 —— 请手动回到金币狂欢节页面")
-            time.sleep(30)
-        else:
-            log(f"[返回:{provider}] reason={reason}")
-            adb_back()
+        # 非广告页被判"非金币页": 先让导航AI判断能否从首页/我的一步步点回金币页, 不再盲目BACK退到桌面死循环
+        try:
+            nav = call_vlm(b64, mode="nav")
+            nact = nav.get("action", "BACK")
+            log(f"[导航:{nav.get('_provider','?')}] {nact} reason={nav.get('reason','')}")
+            if nact == "CLICK":
+                try:
+                    rx = float(nav.get("x", 500))
+                    ry = float(nav.get("y", 500))
+                except (TypeError, ValueError):
+                    rx, ry = 500, 500
+                x = int(rx / 1000 * ow) + random.randint(-OFFSET, OFFSET)
+                y = int(ry / 1000 * oh) + random.randint(-OFFSET, OFFSET)
+                log(f"[导航点击] 坐标({x},{y})")
+                adb_tap(x, y)
+                act = "CLICK"
+                _back_streak = 0
+            elif nact == "SWIPE":
+                adb_swipe_up()
+                act = "SWIPE"
+                _back_streak = 0
+            elif nact == "NONE":
+                act = "WAIT"   # 导航AI确认已在金币页, 本轮不动作
+                _back_streak = 0
+        except Exception as e:
+            log(f"[导航异常] {str(e)[:40]}")
+        if act == "BACK":
+            _back_streak += 1
+            if _back_streak >= 2:
+                # 连导航AI都连续判定要返回: 暂停等用户手动回金币页(最后手段)
+                log(f"[导航失败] 连续{_back_streak}次无法回到金币页, 暂停30秒 —— 请手动回到金币狂欢节页面")
+                time.sleep(30)
+            else:
+                log(f"[返回:{provider}] reason={reason}")
+                adb_back()
         # BACK后如果还在广告页: 广告流程尚未走完, 交给主循环ad_streak判断是否重启, 不在此打断
     else:
         log(f"[等待:{provider}] reason={reason}")
