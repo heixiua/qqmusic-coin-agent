@@ -51,32 +51,6 @@ SKIP_PROB = 0.08          # 随机跳过本轮概率(反风控)
 RESIZE_WIDTH = 800        # 送模型的图片宽度
 SCREEN_PATH = "screen_tmp.png"
 
-# ===== 断点测试模式(仅调试用): 设置环境变量 STEP_MODE=1 =====
-# 拦截脚本里所有 >=1 秒的等待, 每次暂停:
-#   回车 = 按计划等待(观察这一步实际停多久)
-#   s    = 跳过这次等待(判断该等太久/不必要)
-#   q    = 退出脚本
-STEP_MODE = os.getenv("STEP_MODE", "") == "1"
-if STEP_MODE:
-    print("[断点] STEP_MODE 已开启: 每次>=1s等待会暂停 (回车=等待 / s=跳过 / q=退出)", flush=True)
-    _real_sleep = time.sleep
-
-    def _debug_sleep(seconds, *args, **kwargs):
-        try:
-            if seconds >= 1.0:
-                cmd = input(f"[断点] sleep {seconds:.1f}s -> 回车=等待 / s=跳过 / q=退出 > ").strip().lower()
-                if cmd == "q":
-                    print("[断点] 用户终止", flush=True)
-                    sys.exit(0)
-                if cmd == "s":
-                    print(f"[断点] 跳过 {seconds:.1f}s", flush=True)
-                    return
-        except EOFError:
-            pass
-        _real_sleep(seconds, *args, **kwargs)
-
-    time.sleep = _debug_sleep
-
 # ===== 版本2: 金币页硬编码优先(减少AI调用) =====
 # 用户指定只刷: ①看视频领金币/看视频得高额金币(按钮文本=看视频) ②抽奖赢金币(立即抽奖) ③金币抽奖页(看广告抽奖)
 # ④广告闭环弹窗(浏览5秒/观看下一条/观看完成)——这些是看完广告后连刷入口, 必须保留
@@ -382,39 +356,18 @@ def call_vlm(img_b64, mode="normal"):
             print(f"⚠️ [{p['name']}] 调用失败({str(e)[:60]}), 切换下一家...")
     return {"action": "WAIT", "reason": f"全部视觉模型失败: {str(last_err)[:80]}"}
 
-def _action_gate(label):
-    """断点模式下执行动作前暂停: 回车=执行 / s=跳过这个动作 / q=退出"""
-    if not STEP_MODE:
-        return True
-    try:
-        cmd = input(f"[断点-动作] 即将{label} -> 回车=执行 / s=跳过 / q=退出 > ").strip().lower()
-        if cmd == "q":
-            print("[断点] 用户终止", flush=True)
-            sys.exit(0)
-        return cmd != "s"
-    except EOFError:
-        return True
-
 def adb_tap(x, y):
-    if not _action_gate(f"点击({int(x)},{int(y)})"):
-        return
     subprocess.run([ADB, "shell", "input", "tap", str(int(x)), str(int(y))], check=True)
 
 def adb_back():
-    if not _action_gate("按返回键"):
-        return
     subprocess.run([ADB, "shell", "input", "keyevent", "4"], check=True)
 
 def adb_swipe_up():
     """向上滑动(查看下方任务); 用屏幕中下部滑到上部"""
-    if not _action_gate("上滑(查看下方)"):
-        return
     subprocess.run([ADB, "shell", "input", "swipe", "500", "1600", "500", "400", "500"], check=True)
 
 def adb_swipe_down():
     """向下滑动(回到页面顶部); 用屏幕上中部滑到下部"""
-    if not _action_gate("下滑(回页面顶部)"):
-        return
     subprocess.run([ADB, "shell", "input", "swipe", "500", "600", "500", "1800", "500"], check=True)
 
 # ===== 播放页等待: 听满15秒金币才到账, 不能立刻BACK =====
