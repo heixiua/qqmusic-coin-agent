@@ -174,6 +174,19 @@ NAV_PROMPT = (
     "严禁点击: 活动任务区的下载/打开/分享/收藏/关注类任务、广告按钮。只输出JSON。"
 )
 
+# 全量扫描prompt: 逐屏判断四个指定任务是否还有可做的
+SCAN_TASKS = ["看视频领金币", "看视频得高额金币", "抽奖赢金币", "金币抽奖"]
+SCAN_PROMPT = (
+    "你是金币任务全量扫描Agent。判断当前截图是否为【金币狂欢节/金币中心】任务页, 并判断四个指定任务在本屏的状态。"
+    "只输出一个JSON对象, 不要多余文字。\n"
+    "四个任务: 看视频领金币 / 看视频得高额金币 / 抽奖赢金币 / 金币抽奖(看广告领好礼、金币抽奖格子)。\n"
+    "每个任务状态: available=按钮可点且未完成(如看视频/领金币/立即抽奖/去抽奖); "
+    "done=显示已完成/已领完/明日再来/次数0/今日奖品已派发完毕; absent=本屏没有这个任务。\n"
+    "输出格式: {\"is_coin_page\":true或false, \"看视频领金币\":\"available|done|absent\", "
+    "\"看视频得高额金币\":\"...\", \"抽奖赢金币\":\"...\", \"金币抽奖\":\"...\"}\n"
+    "只输出JSON。"
+)
+
 def log(msg):
     line = f"[{time.strftime('%H:%M:%S')}] {msg}"
     print(line, flush=True)
@@ -295,10 +308,15 @@ def call_vlm(img_b64, mode="normal"):
     last_err = None
     sys_prompt = (AD_ENTRY_PROMPT if mode == "ad" else
                   AD_CLOSE_PROMPT if mode == "close" else
-                  NAV_PROMPT if mode == "nav" else SYSTEM_PROMPT)
+                  NAV_PROMPT if mode == "nav" else
+                  SCAN_PROMPT if mode == "scan" else SYSTEM_PROMPT)
     # 金币页常规判断时附上最近动作历史(纯文本短期记忆), 让模型能看到自己在重复什么
     user_text = "分析这张手机截图，按规则输出JSON。"
-    if mode == "normal":
+    if mode == "scan":
+        user_text = "扫描这张截图，按规则输出四个任务状态JSON。"
+        if tian_draw_exhausted():
+            user_text += " (抽奖赢金币本会话已确认0/10, 直接按done处理)"
+    elif mode == "normal":
         # 只给动作序列(SWIPE/CLICK/TOP...), 不给任务名: 防止模型看到"点过看视频"就判定任务已完成
         user_text = f"最近动作历史(旧→新): {action_history_text(with_reason=False)}\n" + user_text
         if tian_draw_exhausted():
@@ -670,6 +688,43 @@ def run_once():
     time.sleep(w)
     return act
 
+def full_scan():
+    """全量扫描: 回到金币页顶部, 逐屏下滑到底, 检查四个指定任务是否还有可做的.
+    只有确认在金币页且整页扫描都没发现可做任务时, 才返回 True(今日任务全部完成)"""
+    log("[全量扫描] 开始: 回到金币页顶部并逐屏扫描四个任务")
+    for _ in range(6):
+        adb_swipe_down()
+        time.sleep(0.4)
+    seen_available = set()
+    seen_done = set()
+    coin_page_seen = False
+    for step in range(8):
+        try:
+            (ow, oh), b64 = capture_and_encode()
+            result = call_vlm(b64, mode="scan")
+        except Exception as e:
+            log(f"[全量扫描] 第{step+1}屏失败: {str(e)[:40]}")
+            break
+        if result.get("is_coin_page"):
+            coin_page_seen = True
+        states = []
+        for t in SCAN_TASKS:
+            st = str(result.get(t, "absent")).strip().lower()
+            states.append(f"{t}={st}")
+            if st == "available":
+                seen_available.add(t)
+            elif st == "done":
+                seen_done.add(t)
+        log(f"[全量扫描] 第{step+1}屏: " + "  ".join(states))
+        if step < 7:
+            adb_swipe_up()
+            time.sleep(0.6)
+    if tian_draw_exhausted():
+        seen_available.discard("抽奖赢金币")
+        seen_done.add("抽奖赢金币")
+    log(f"[全量扫描] 结果: 可做={sorted(seen_available) or '无'} | 已完成={sorted(seen_done) or '无'} | 确认金币页={coin_page_seen}")
+    return coin_page_seen and not seen_available
+
 def main():
     if not os.getenv("AGNES_API_KEY"):
         log("!! .env 里没有 AGNES_API_KEY")
@@ -710,6 +765,7 @@ def main():
     n = 0
     wait_streak = 0   # 连续WAIT计数, 连续3次强制BACK兜底
     swipe_streak = 0  # 连续SWIPE计数, 连续6次滚回页面顶部
+    no_click = 0      # 连续没有点到任何任务的轮数, >=8 触发全量扫描
 
     # ===== 广告流程状态机 (代码强制流转, 不靠模型猜状态) =====
     # AD_IDLE=0 正常金币页 | AD_ENTRY=1 刚进广告页→点跳转按钮(了解详情/立即咨询)
@@ -871,6 +927,14 @@ def main():
             return True
         return False
 
+    # 启动先做一次全量扫描: 四个任务全部完成则直接退出; 否则进入正常刷任务
+    if is_in_qqmusic() and not is_ad_activity():
+        if full_scan():
+            log("[全量扫描] 今日四个任务全部完成, 退出")
+            return
+    else:
+        log("[全量扫描] 当前不在金币页或处于广告页, 跳过启动扫描")
+
     while n < rounds:
         n += 1
         log(f"===== 第 {n}/{rounds} 轮 =====")
@@ -892,6 +956,7 @@ def main():
 
         # 广告状态机优先: 一旦进入广告流程, 由状态机接管直到回金币页
         if is_ad_activity():
+            no_click = 0   # 广告流程有推进, 重置"无点击"计数
             if ad_state == AD_IDLE:
                 ad_state = AD_ENTRY
             ad_step(1080, 2400)
@@ -930,6 +995,22 @@ def main():
             swipe_streak += 1
         else:
             swipe_streak = 0
+
+        # 连续多轮没点到任何任务 -> 全量扫描一次; 四个任务都没有可做的就退出
+        if act == "CLICK":
+            no_click = 0
+        elif act in ("SWIPE", "TOP", "BACK", "WAIT", "PLAY_WAIT"):
+            no_click += 1
+        else:
+            no_click = 0
+        if no_click >= 8:
+            if full_scan():
+                log("[全量扫描] 今日四个任务全部完成, 退出")
+                return
+            no_click = 0
+            wait_streak = 0
+            swipe_streak = 0
+
         time.sleep(SHOT_INTERVAL)
     log("到达轮数上限, 结束。")
 
