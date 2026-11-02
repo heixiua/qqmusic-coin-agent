@@ -45,7 +45,7 @@ AGNES_MODEL = os.getenv("AGNES_MODEL", "agnes-3.0-flash")
 
 MAX_ROUNDS = 200          # 单次运行最多轮数
 SHOT_INTERVAL = 2.0       # 连续截图最小间隔(秒)
-WAIT_MIN, WAIT_MAX = 6.0, 15.0   # 每次动作后随机等待(反风控)
+WAIT_MIN, WAIT_MAX = 2.0, 4.0    # 每次动作后随机等待(反风控, 用户调试后从6-15s收紧到2-4s)
 OFFSET = 12               # 点击坐标随机偏移(千分比坐标下偏移1.2%)
 SKIP_PROB = 0.08          # 随机跳过本轮概率(反风控)
 RESIZE_WIDTH = 800        # 送模型的图片宽度
