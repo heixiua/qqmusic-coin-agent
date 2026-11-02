@@ -550,7 +550,7 @@ def _match_task_keyword(txt):
 
 def run_once():
     """单轮: 硬编码优先 -> 截屏识图兜底"""
-    global _last_had_click, _last_uia_pos, _last_uia_time, _uia_streak, _play_wait_start, _back_streak, _post_ad_round, _tian_draw_exhausted_until, _video_top_exhausted_until, _last_click_reason, _need_scan
+    global _last_had_click, _last_uia_pos, _last_uia_time, _uia_streak, _play_wait_start, _back_streak, _post_ad_round, _tian_draw_exhausted_until, _video_top_exhausted_until, _last_click_reason, _need_scan, _only_probe_draw
     post_ad = _post_ad_round   # 本轮的"刚关广告"状态只消费一次
     _post_ad_round = False
     last_click = _last_click_reason   # 上一轮点的是什么(只用一次)
