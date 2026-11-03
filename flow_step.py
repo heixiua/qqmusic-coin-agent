@@ -553,17 +553,19 @@ def goto_coin_center():
     return ok
 
 
-def wait_coin_center(timeout=9.0, interval=0.9):
-    """轮询等"真的回到金币中心"。为什么要等: 退出广告后 WebView 重渲染要 2~5s,
+def wait_coin_center(timeout=9.0, interval=0.9, check=None):
+    """轮询等"真的回到目标页"。为什么要等: 退出广告后 WebView 重渲染要 2~5s,
     单次判定会把"正在加载的白屏"误判成"没回去", 接着盲点左上角 —— 而那个位置在
-    金币中心上就是"返回"箭头, 会把人直接踢出金币中心(页面就乱了)。"""
+    金币中心上就是"返回"箭头, 会把人直接踢出金币中心(页面就乱了)。
+    check: 目标判定函数, 默认 on_coin_center(金币中心); 任务18传"金币中心或抽奖页"。”"""
+    check = check or on_coin_center
     t0 = time.time()
     while time.time() - t0 < timeout:
-        if on_coin_center():
-            log(f"[等待] {time.time() - t0:.1f}s 已回到金币中心")
+        if check():
+            log(f"[等待] {time.time() - t0:.1f}s 已回到目标页")
             return True
         time.sleep(interval)
-    log(f"[等待] {timeout:.0f}s 内没回到金币中心")
+    log(f"[等待] {timeout:.0f}s 内没回到目标页")
     return False
 
 
@@ -852,50 +854,53 @@ AD_FORM_UNKNOWN = "未知形态"
 DOOR_EXIT_PLAIN = [(556, 93), (622, 89), (438, 93), (500, 659)]
 
 
-def _try_door_exit(ow, oh, tag, candidates):
-    """按给定候选顺序试门页出口; 每个候选点完判是否回金币中心, 页面变化了但没回就等渲染。
-    全部没反应 -> 视觉兜底找退出入口。返回是否回到金币中心。"""
+def _try_door_exit(ow, oh, tag, candidates, check=None):
+    """按给定候选顺序试门页出口; 每个候选点完判是否回目标页, 页面变化了但没回就等渲染。
+    全部没反应 -> 视觉兜底找退出入口。check: 目标判定, 默认金币中心。"""
+    check = check or on_coin_center
     before = "_fs_dx_pre.png"
     screencap(before)
     for i, (rx, ry) in enumerate(candidates, 1):
         tap_human(int(rx / 1000 * ow), int(ry / 1000 * oh))
         time.sleep(1.8)
-        if on_coin_center():
-            log(f"[广告{tag}] 门页出口#{i} 命中, 回到金币中心")
+        if check():
+            log(f"[广告{tag}] 门页出口#{i} 命中, 回到目标页")
             return True
         screencap("_fs_dx_post.png")
         if _dist(_fp(before), _fp("_fs_dx_post.png")) >= 6.0:
             log(f"[广告{tag}] 门页出口#{i} 让页面变了, 等它渲染")
-            if wait_coin_center(timeout=4.0):
+            if wait_coin_center(timeout=4.0, check=check):
                 return True
             break
     log(f"[广告{tag}] 门页出口候选都没反应 -> 走视觉兜底")
     tap_by_vision(target=EXIT_VISUAL_TARGET, tag=f"-DOOREXIT{tag}")
-    return wait_coin_center(timeout=6.0)
+    return wait_coin_center(timeout=6.0, check=check)
 
 
-def _close_landing_x(ow, oh, tag):
+def _close_landing_x(ow, oh, tag, check=None):
     """点广告落地页左上 ✕(回到门页"恭喜已获得奖励")。
-    不同平台的 ✕ 位置差 20~30px, 先点近的那个, 页面没反应再点另一个 —— 只在"没反应"时才点第二次。"""
+    不同平台的 ✕ 位置差 20~30px, 先点近的那个, 页面没反应再点另一个 —— 只在"没反应"时才点第二次。
+    check: 目标判定, 默认金币中心。"""
+    check = check or on_coin_center
     log(f"[广告{tag}] 点广告页左上'✕'")
     screencap("_fs_adx_pre.png")
     tap_human(int(AD_WEBVIEW_X_REL[0] / 1000 * ow), int(AD_WEBVIEW_X_REL[1] / 1000 * oh))
     time.sleep(1.8)
-    if on_coin_center():
+    if check():
         return True
     screencap("_fs_adx_post.png")
     if _dist(_fp("_fs_adx_pre.png"), _fp("_fs_adx_post.png")) < 6.0:
         log(f"[广告{tag}] ✕ 没反应, 换第二个候选点")
         tap_human(int(AD_WEBVIEW_X2_REL[0] / 1000 * ow), int(AD_WEBVIEW_X2_REL[1] / 1000 * oh))
         time.sleep(1.8)
-        if on_coin_center():
+        if check():
             return True
         screencap("_fs_adx_post2.png")
         if _dist(_fp("_fs_adx_pre.png"), _fp("_fs_adx_post2.png")) < 6.0:
             log(f"[广告{tag}] 两个 ✕ 都没反应 -> 走视觉兜底找关闭入口")
             tap_by_vision(target=EXIT_VISUAL_TARGET, tag=f"-EXIT{tag}")
             time.sleep(1.2)
-            if on_coin_center():
+            if check():
                 return True
     return False
 
@@ -917,89 +922,95 @@ def _countdown_running():
     return float((roi > 120).mean()) > 0.02
 
 
-def _handle_video_reward(ow, oh, tag):
+def _handle_video_reward(ow, oh, tag, check=None):
     """视频倒计时型(前台 TMECore): 视频长度不定(15s/30s), 看满才给奖。
     解法 = 常规停留 16~18.5s(覆盖多数15s) -> 轮询倒计时圆圈, 消失才算看完
     -> 点顶部「退出」-> 出口链 -> 挽留窗。
     2026-11-03 教训: 30s 视频只等 17.5s 就去点"退出", 全部无效, 还误入抢救把奖励丢了。"""
+    check = check or on_coin_center
     _ad_stay(tag)
     for i in range(6):                      # 再给最多 ~36s, 覆盖 30s 长视频
-        if on_coin_center():
+        if check():
             return True
         if not _countdown_running():
             log(f"[广告{tag}] 倒计时圆圈已消失(第{i + 1}次检测) -> 视频看完")
             break
         log(f"[广告{tag}] 倒计时还在走, 再等 6s (第{i + 1}次)")
         time.sleep(6)
-    if on_coin_center():
+    if check():
         return True
     log(f"[广告{tag}] 点顶部「退出」退出视频页")
     tap_human(int(0.622 * ow), int(0.0888 * oh))     # 顶部黑条右侧"退出" (实测 672,213)
-    if wait_coin_center(timeout=8.0):
+    if wait_coin_center(timeout=8.0, check=check):
         return True
-    if _try_door_exit(ow, oh, tag, DOOR_EXIT_CANDIDATES):
+    if _try_door_exit(ow, oh, tag, DOOR_EXIT_CANDIDATES, check=check):
         return True
-    return _rescue_giveup(ow, oh, tag)
+    return _rescue_giveup(ow, oh, tag, check=check)
 
 
-def _rescue_giveup(ow, oh, tag):
+def _rescue_giveup(ow, oh, tag, check=None):
     """兜底: 出口候选都没回去 -> 多半弹了"现在退出就没有奖励哦"挽留窗
-    (没有橙色按钮, 扫描会失明), 点"放弃奖励"解围。"""
+    (没有橙色按钮, 扫描会失明), 点"放弃奖励"解围。check: 目标判定, 默认金币中心。"""
+    check = check or on_coin_center
     for attempt in (1, 2):
-        log(f"[广告{tag}] 未回金币中心, 判定为挽留窗 -> 点'放弃奖励' (第{attempt}次)")
+        log(f"[广告{tag}] 未回目标页, 判定为挽留窗 -> 点'放弃奖励' (第{attempt}次)")
         tap_human(int(AD_GIVEUP_REL[0] / 1000 * ow), int(AD_GIVEUP_REL[1] / 1000 * oh))
         time.sleep(1.8)
-        if on_coin_center():
-            log(f"[广告{tag}] '放弃奖励'后已回到金币中心")
+        if check():
+            log(f"[广告{tag}] '放弃奖励'后已回到目标页")
             return True
-    log(f"[广告{tag}] 警告: 仍未能回到金币中心")
+    log(f"[广告{tag}] 警告: 仍未能回到目标页")
     return False
 
 
-def _handle_plain_door(ow, oh, tag):
+def _handle_plain_door(ow, oh, tag, check=None):
     """纯白说明型门页: 没有 CTA 可点, 停满 15s 平台就发奖励。
     出口优先黑条"退出"(实测 599,222), 跳过素材型右上角✕(纯白型没有, 每次白等 1.8s)。"""
+    check = check or on_coin_center
     log(f"[广告{tag}] 纯白说明型门页 -> 不点 CTA, 直接计时")
     _ad_stay(tag)
     log(f"[广告{tag}] 一直停在门页, 跳过落地页✕, 直接找门页出口")
-    return _try_door_exit(ow, oh, tag, DOOR_EXIT_PLAIN)
+    return _try_door_exit(ow, oh, tag, DOOR_EXIT_PLAIN, check=check)
 
 
-def _handle_material_door(ow, oh, tag):
+def _handle_material_door(ow, oh, tag, check=None):
     """素材型门页: 点 CTA 跳落地页 -> 浏览满 15s -> 落地页✕ -> 门页出口。
     CTA 点不动时退化为"纯白型"处理(停满直接找出口, 不硬点)。"""
+    check = check or on_coin_center
     landed = tap_door_cta(ow, oh, tag)
     _ad_stay(tag)
     if not landed:
         log(f"[广告{tag}] CTA 没点动, 视为停在门页, 直接找门页出口")
-        if _try_door_exit(ow, oh, tag, DOOR_EXIT_CANDIDATES):
+        if _try_door_exit(ow, oh, tag, DOOR_EXIT_CANDIDATES, check=check):
             return True
-        return _rescue_giveup(ow, oh, tag)
-    if _close_landing_x(ow, oh, tag):
+        return _rescue_giveup(ow, oh, tag, check=check)
+    if _close_landing_x(ow, oh, tag, check=check):
         return True
-    if _try_door_exit(ow, oh, tag, DOOR_EXIT_CANDIDATES):
+    if _try_door_exit(ow, oh, tag, DOOR_EXIT_CANDIDATES, check=check):
         return True
-    return _rescue_giveup(ow, oh, tag)
+    return _rescue_giveup(ow, oh, tag, check=check)
 
 
-def _handle_landing_page(ow, oh, tag):
+def _handle_landing_page(ow, oh, tag, check=None):
     """落地页ADActivity(入口点击后直接进广告落地页, 没有门页): 计时 -> 落地页✕ -> 门页出口。"""
+    check = check or on_coin_center
     log(f"[广告{tag}] 不是门页, 视为已在广告/落地页")
     _ad_stay(tag)
-    if _close_landing_x(ow, oh, tag):
+    if _close_landing_x(ow, oh, tag, check=check):
         return True
-    if _try_door_exit(ow, oh, tag, DOOR_EXIT_CANDIDATES):
+    if _try_door_exit(ow, oh, tag, DOOR_EXIT_CANDIDATES, check=check):
         return True
-    return _rescue_giveup(ow, oh, tag)
+    return _rescue_giveup(ow, oh, tag, check=check)
 
 
-def _handle_unknown_ad(ow, oh, tag):
+def _handle_unknown_ad(ow, oh, tag, check=None):
     """未知形态兜底: 计时 -> 视觉找退出; 再不行按挽留窗"放弃奖励"解围。"""
+    check = check or on_coin_center
     log(f"[广告{tag}] 未知广告形态 -> 计时后视觉找出口")
     _ad_stay(tag)
-    if _try_door_exit(ow, oh, tag, DOOR_EXIT_CANDIDATES):
+    if _try_door_exit(ow, oh, tag, DOOR_EXIT_CANDIDATES, check=check):
         return True
-    return _rescue_giveup(ow, oh, tag)
+    return _rescue_giveup(ow, oh, tag, check=check)
 
 
 AD_HANDLERS = {
@@ -1011,9 +1022,10 @@ AD_HANDLERS = {
 }
 
 
-def handle_ad(tag="", entry_shot="_fs_entry.png"):
+def handle_ad(tag="", entry_shot="_fs_entry.png", back_check=None):
     """广告形态分发器: 识别形态 -> 分派到 AD_HANDLERS 对应 handler。
-    返回是否成功回到金币中心。"""
+    back_check: 目标判定函数(默认认金币中心; 任务18传"金币中心或抽奖九宫格")。
+    返回是否成功回到目标页。"""
     changed, used, d, _ = wait_change(entry_shot, timeout=4.0)
     log(f"[广告{tag}] 入口点击后 {used:.1f}s 页面{'已跳转' if changed else '没变化'}")
 
@@ -1037,7 +1049,7 @@ def handle_ad(tag="", entry_shot="_fs_entry.png"):
 
     log(f"[广告{tag}] 形态={form}")
     handler = AD_HANDLERS.get(form, AD_HANDLERS[AD_FORM_UNKNOWN])
-    return handler(ow, oh, tag)
+    return handler(ow, oh, tag, back_check)
 
 
 def run_ad_once(tag="", entry_shot="_fs_entry.png"):
@@ -1201,35 +1213,13 @@ def run_task2_round(n):
         run_incentive_chain(max_n=6, tag=f"T2-{n}")
         return "incentive"
 
-    # 广告有两种形态, 必须分开走:
-    #   A) 白屏 + 顶部黑条倒计时: 页面自己数完 15s, 点「退出」即可(不用点任何按钮)
-    #   B) 门页「点击后浏览15秒」+ 底部蓝色 CTA: 必须点 CTA 跳转, 浏览满 15s 才算完成
+    # 广告形态交给统一分发器(门页/落地页/视频倒计时/未知都由 AD_HANDLERS 处理,
+    # 30s 视频由 _handle_video_reward 用倒计时圆圈检测, 不再写死停留时长)
     time.sleep(1.2)             # 让门页渲染完再判定(判早了会当成"直停型", 白等 17s 不给奖励)
-    if is_door_page():
-        log(f"[T2-{n}] 门页型广告 -> 走门页流程(点CTA -> 浏览15s -> 返回)")
-        ok_ad = run_ad_once(tag=f"T2-{n}", entry_shot="_fs_t2_entry.png")
-        if not ok_ad:
-            log(f"[T2-{n}] 门页型广告没能回到金币中心, 本轮放弃")
-            return None
-    else:
-        # A 型: 白屏 + 顶部黑条倒计时, 不需要点任何 CTA, 等它数完
-        stay = random.uniform(*AD_STAY_RANGE)
-        log(f"[T2-{n}] 直停型广告, 停留 {stay:.2f}s (等倒计时自己走完)")
-        time.sleep(stay)
-
-        log(f"[T2-{n}] 点顶部「退出」")
-        tap_human(int(0.622 * ow), int(0.0888 * oh))     # 实测 (672,213)
-        ok_back = wait_coin_center(timeout=9.0)
-        if not ok_back:                                  # 可能被带去别的 App
-            if ensure_in_app():
-                ok_back = wait_coin_center(timeout=6.0)
-        if not ok_back:                                  # 再补一次「退出」(此时已确认不在金币中心, 不误伤)
-            log(f"[T2-{n}] 还没回去 -> 再点一次「退出」")
-            tap_human(int(0.622 * ow), int(0.0888 * oh))
-            ok_back = wait_coin_center(timeout=8.0)
-        if not ok_back:
-            log(f"[T2-{n}] 警告: 未能回到金币中心, 本轮放弃(不乱点, 留页面给人工看)")
-            return None
+    ok_ad = handle_ad(tag=f"T2-{n}", entry_shot="_fs_t2_entry.png")
+    if not ok_ad:
+        log(f"[T2-{n}] 广告流程没能回到金币中心, 本轮放弃")
+        return None
 
     # 回列表: 按钮已变成「领金币」, 再点一次真正领取
     kind1, _ = detect_popup()        # 偶尔退出后就自动弹了激励, 这种情况不用再点
@@ -1866,12 +1856,18 @@ def lottery_draw_once(tag=""):
             return True
         time.sleep(1.0)
     if ad:
-        # 先走浏览型(实测主形态: 点「点击浏览15秒」-> 落地页 -> 两层✕), 失败再走视频型兜底
-        if not lottery_browse_ad_flow(ow, oh, tag=tag):
-            if not lottery_ad_exit(ow, oh, tag=tag):
-                log(f"[金币抽奖·{tag}] 广告没退出 -> 抢救")
-                if not rescue_from_stuck_ad():
-                    return False
+        # 统一走广告分发器(门页/落地页/视频倒计时/未知 4 形态, 含30s视频倒计时检测)。
+        # back_check = 金币中心 或 抽奖九宫格(广告退出后可能落在任一处, 都算成功)。
+        # 分发器失败再走任务18特有兜底(浏览型/视频型)。
+        def _lot_back():
+            return on_coin_center() or _lottery_state()[0] is not None
+        if not handle_ad(tag=f"L{tag}", entry_shot="_fs_lot_dsize.png", back_check=_lot_back):
+            log(f"[金币抽奖·{tag}] 分发器没退出来 -> 走任务18特有兜底")
+            if not lottery_browse_ad_flow(ow, oh, tag=tag):
+                if not lottery_ad_exit(ow, oh, tag=tag):
+                    log(f"[金币抽奖·{tag}] 广告没退出 -> 抢救")
+                    if not rescue_from_stuck_ad():
+                        return False
         time.sleep(2.5)
     # 等结果弹窗
     for _ in range(10):
