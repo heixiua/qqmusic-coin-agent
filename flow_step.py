@@ -1489,6 +1489,8 @@ def ensure_draw_page(max_attempt=6):
             if wait_draw_page(timeout=2.6):
                 return True
     for _ in range(2):                          # 抽奖页左上角返回 -> 金币中心
+        if on_coin_center():                    # 已在金币中心: 别再点(67,155), 会误入内容页
+            break
         tap_human(67, 155)
         time.sleep(1.8)
         if draw_page_state() == "draw":
@@ -1519,6 +1521,10 @@ def ensure_draw_page(max_attempt=6):
         log(f"[抽奖] 第{i + 1}次下滚找「抽奖赢金币」")
         _adb("shell", "input", "swipe", "540", "1700", "540", "800", "450")
         time.sleep(1.2)
+    # 下滑 max_attempt 次仍找不到行: 页面正常(在金币中心) -> 行已消失 = 已刷完(完成信号)
+    if on_coin_center():
+        log("[抽奖] 「抽奖赢金币」行消失且页面在金币中心 -> 已刷完(完成信号)")
+        return "done"
     return draw_page_state() == "draw"
 
 
@@ -1557,7 +1563,11 @@ def run_draw_round(n):
       出结果窗 = 抽到一次 / 进广告 = 这次只补次数 / 页面没变 = 次数用完(明天再来)。"""
     log(f"===== 抽奖第 {n} 轮开始 =====")
     ensure_in_app()
-    if not ensure_draw_page():
+    ep = ensure_draw_page()
+    if ep == "done":                     # 「抽奖赢金币」行消失 = 已刷完
+        log(f"[抽奖{n}] 「抽奖赢金币」入口消失 -> 已刷完(完成信号)")
+        return "done"
+    if not ep:
         log(f"[抽奖{n}] 进不去抽奖页, 放弃本轮")
         return None
     spins, tries = 0, 0
@@ -1784,6 +1794,7 @@ def run_timed_once(tag="定时领金币", max_scroll=10):
 # 两个橙块宽度相同(x 都固定在≈538), 只是文字不同, 用灰度模板区分。
 LOTTERY_FREE_TPL = "tpl_lottery_free.png"
 LOTTERY_DRAW_TPL = "tpl_lottery_draw.png"
+LOTTERY_TOMORROW_TPL = "tpl_lottery_tomorrow.png"   # 九宫格中心"明日再来"= 今日次数用完(完成信号)
 LOTTERY_BROWSE_CTA_REL = (500, 896)   # 浏览型广告: 底部「点击浏览15秒」蓝字 (实测 540,2150)
 LOTTERY_TPL_X = 455                 # 模板在屏上的固定 x 起点(2026-11-03 实测按钮 x≈469-607, 模板裁剪自 x=455)
 LOTTERY_MAX_DRAW = 10               # 每日上限(页面写 10 次)
@@ -1819,6 +1830,7 @@ def _lottery_state():
     oh, ow = a.shape
     tf = np.asarray(Image.open(LOTTERY_FREE_TPL).convert("L")).astype(np.int16)
     td = np.asarray(Image.open(LOTTERY_DRAW_TPL).convert("L")).astype(np.int16)
+    tt = np.asarray(Image.open(LOTTERY_TOMORROW_TPL).convert("L")).astype(np.int16)
 
     def scan(tpl):
         th, tw = tpl.shape
@@ -1832,13 +1844,17 @@ def _lottery_state():
 
     df, yf, thf, twf = scan(tf)
     dd, yd, thd, twd = scan(td)
-    log(f"[金币抽奖·状态] free差异{df:.1f} draw差异{dd:.1f}")
+    dt, yt, tht, twt = scan(tt)
+    log(f"[金币抽奖·状态] free差异{df:.1f} draw差异{dd:.1f} tomorrow差异{dt:.1f}")
     cf = (int(LOTTERY_TPL_X + twf / 2), yf + thf // 2)
     cd = (int(LOTTERY_TPL_X + twd / 2), yd + thd // 2)
+    ct = (int(LOTTERY_TPL_X + twt / 2), yt + tht // 2)
     if df < 5.0 and df <= dd:
         return "free", cf
     if dd < 5.0:
         return "draw", cd
+    if dt < 5.0:                       # 九宫格中心"明日再来" = 今日已刷完(完成信号)
+        return "tomorrow", ct
     return None, None
 
 
@@ -1884,7 +1900,26 @@ def ensure_lottery_module(max_scroll=14):
             return True
         _adb("shell", "input", "swipe", "540", "1500", "540", "900", "450")
         time.sleep(1.2)
-    return bool(find_lottery_free() or find_lottery_draw())
+    # 兜底: 回顶部 -> 下滑3次(实测路径, 小幅度滚动滑不到九宫格)露出金币抽奖板块, 再检查
+    for _ in range(6):
+        before = "_fs_lt_top.png"
+        screencap(before)
+        _adb("shell", "input", "swipe", "540", "1750", "540", "700", "400")
+        time.sleep(1.1)
+        screencap("_fs_lt_top2.png")
+        if _dist(_fp(before), _fp("_fs_lt_top2.png")) < 3.0:
+            break
+    for _ in range(3):
+        _adb("shell", "input", "swipe", "540", "1700", "540", "800", "450")
+        time.sleep(1.0)
+    if find_lottery_free() or find_lottery_draw():
+        return True
+    # 免费卡/看广告格都找不到, 但九宫格中心是"明日再来" -> 今日已刷完(完成信号)
+    st, _ = _lottery_state()
+    if st == "tomorrow":
+        log("[金币抽奖] 免费卡与看广告格均消失, 检测到「明日再来」 -> 已刷完(完成信号)")
+        return "done"
+    return False
 
 
 def lottery_browse_ad_flow(ow, oh, tag=""):
@@ -2066,7 +2101,11 @@ def lottery_draw_once(tag=""):
 def run_lottery_round(n, max_draw=LOTTERY_MAX_DRAW):
     log(f"===== 金币抽奖 第 {n} 轮开始 =====")
     ensure_in_app()
-    if not ensure_lottery_module():
+    em = ensure_lottery_module()
+    if em == "done":                     # 免费卡/看广告格消失 + 「明日再来」 -> 已刷完
+        log("[金币抽奖] 今日次数已用完(明日再来), 不再抽")
+        return "done"
+    if not em:
         log("[金币抽奖] 找不到模块, 放弃本轮")
         return
     lottery_free_once()                 # 状态A(今天若没做过)
@@ -2182,22 +2221,34 @@ def run_all_daily_tasks(n1=5, n2=3):
 
     # ---------- 任务2: 看视频得高额金币(需下滑找行) ----------
     log("########## 任务2: 看视频得高额金币 ##########")
-    btn = scroll_find_task2()
-    if not btn:
-        _rec(results, "看视频得高额金币", "STOPPED(找不到行)", 0, "下滑后仍找不到任务行")
+    if not on_coin_center() and not goto_coin_center():
+        # 不在金币中心就找不到行, 此时"找不到行"不是完成信号, 是导航失败
+        _rec(results, "看视频得高额金币", "STOPPED(不在金币中心)", 0, "导航失败, 无法定位任务行")
     else:
-        log(f"[调度] 任务2入口 ({btn[0]},{btn[1]})")
-        _run_one_task(results, "看视频得高额金币", n2, run_task2_round, "T2")
-        _drain_popup_sched("任务2后")
+        btn = scroll_find_task2()
+        if not btn:
+            # 任务行消失 = 已刷完(完成信号), 不是卡住; 与 run_task2_round 的 TASK_DONE 同语义
+            _rec(results, "看视频得高额金币", "DONE(找不到行=已刷完)", 0, "任务行消失(完成信号)")
+        else:
+            log(f"[调度] 任务2入口 ({btn[0]},{btn[1]})")
+            _run_one_task(results, "看视频得高额金币", n2, run_task2_round, "T2")
+    _drain_popup_sched("任务2后")
+    if not on_coin_center():
+        log("[调度] 任务2滚动后不在金币中心, 重新导航")
+        goto_coin_center()
 
     # ---------- 任务3: 抽奖赢金币(老虎机, 内部跑到10次或明天再来) ----------
     log("########## 任务3: 抽奖赢金币 ##########")
+    if not on_coin_center():
+        goto_coin_center()
     try:
         spins = run_draw_round(1)
     except Exception as e:
         log(f"[抽奖] 异常 {type(e).__name__}: {e}")
         spins = None
-    if spins is None:
+    if spins == "done":
+        _rec(results, "抽奖赢金币", "DONE(找不到行=已刷完)", 0, "「抽奖赢金币」行消失(完成信号)")
+    elif spins is None:
         _rec(results, "抽奖赢金币", "STOPPED(进不去抽奖页)", 0, "ensure_draw_page 失败")
     elif spins >= DRAW_MAX_SPINS:
         _rec(results, "抽奖赢金币", "CAPPED(达每日上限)", spins, f"跑满{DRAW_MAX_SPINS}次")
@@ -2206,12 +2257,17 @@ def run_all_daily_tasks(n1=5, n2=3):
 
     # ---------- 任务4: 金币抽奖(九宫格, 内部跑到10次或抽奖格消失) ----------
     log("########## 任务4: 金币抽奖 ##########")
+    if not on_coin_center():
+        log("[调度] 任务3后不在金币中心, 重新导航")
+        goto_coin_center()
     try:
         ldone = run_lottery_round(1, max_draw=LOTTERY_MAX_DRAW)
     except Exception as e:
         log(f"[金币抽奖] 异常 {type(e).__name__}: {e}")
         ldone = None
-    if ldone is None:
+    if ldone == "done":
+        _rec(results, "金币抽奖", "DONE(明日再来=已刷完)", 0, "今日剩余0次/明日再来(完成信号)")
+    elif ldone is None:
         _rec(results, "金币抽奖", "STOPPED(找不到模块)", 0, "ensure_lottery_module 失败")
     elif ldone >= LOTTERY_MAX_DRAW:
         _rec(results, "金币抽奖", "CAPPED(达每日上限)", ldone, f"跑满{LOTTERY_MAX_DRAW}次")
