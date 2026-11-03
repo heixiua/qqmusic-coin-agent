@@ -30,3 +30,10 @@ venv/
 .vscode/
 .workbuddy/
 qqmusic_agent.bak_*.py
+
+# ===== 运行时临时截图/页面导出(2026-11-03 清理后补规则) =====
+_fs_*.png
+_fs_*.xml
+d.xml
+dd.xml
+task2.xml

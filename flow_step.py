@@ -533,6 +533,11 @@ def goto_coin_center():
     坐标是这台手机实测的(我的 tab 940,2280; 领现金卡片 888,373), 换机型要改。"""
     if on_coin_center():
         return True
+    if focus_is_ad_activity():        # 在广告 Activity 里点「我的」只会更乱, 先抢救
+        log("[导航] 前台是广告 Activity, 先抢救")
+        if not rescue_from_stuck_ad():
+            log("[导航] 抢救失败, 需要人工介入")
+            return False
     log("[导航] 尝试 我的 -> 领现金 -> 金币中心")
     tap_human(940, 2280)          # 底部"我的"
     time.sleep(2.0)
@@ -571,6 +576,55 @@ def ensure_in_app():
         time.sleep(2.2)
         return True
     return False
+
+
+# ---- 广告 Activity 检测与卡死抢救 ----
+# QQ音乐自家广告跑在两个专用 Activity 里: com.qq.e.tg.ADActivity 和
+# com.tencentmusic.ad.tmead.core.activity.TMECoreActivity。包名仍是 com.tencent.qqmusic,
+# 所以 ensure_in_app 认不出来; 它们压在最上层时点击/BACK 都可能被吞,
+# goto_coin_center 会在广告页里盲点「我的」把页面点得更乱(13:33 实录)。
+AD_ACTIVITY_PAT = re.compile(r"ADActivity|tmead|TMECore", re.I)
+
+
+def focus_is_ad_activity():
+    out = _adb("shell", "dumpsys window | grep mCurrentFocus")
+    return bool(AD_ACTIVITY_PAT.search(out or ""))
+
+
+def _screen_dark(shot="_fs_dark.png"):
+    """整页是否近乎全黑(均值<60)。用途有二:
+    1) 跳转/关广告瞬间会闪一帧纯黑过渡(实测 (1,1,1)), 此时任何判定都不可信;
+    2) 广告页彻底卡死时页面也全黑且静止。"""
+    screencap(shot)
+    a = np.asarray(Image.open(shot).convert("RGB")).astype(np.float32)
+    mean = float(a.mean())
+    return mean < 60.0, mean
+
+
+def rescue_from_stuck_ad(max_back=3):
+    """从卡死的广告 Activity 里抢救回来。逐级升级:
+    BACK x N -> am start 主界面 -> force-stop + 重启。返回是否回到可导航状态。"""
+    for i in range(max_back):
+        if not focus_is_ad_activity():
+            break
+        log(f"[抢救] 前台是广告 Activity, 第{i + 1}次 BACK")
+        back()
+        time.sleep(2.5)
+        if on_coin_center():
+            return True
+    if focus_is_ad_activity():
+        log("[抢救] BACK 无效 -> am start 主界面")
+        _adb("shell", "am", "start", "-n",
+             "com.tencent.qqmusic/com.tencent.qqmusic.activity.AppStarterActivity")
+        time.sleep(4.0)
+    if focus_is_ad_activity():
+        log("[抢救] 仍压着 -> force-stop 重启 QQ音乐")
+        _adb("shell", "am", "force-stop", "com.tencent.qqmusic")
+        time.sleep(2.0)
+        _adb("shell", "am", "start", "-n",
+             "com.tencent.qqmusic/com.tencent.qqmusic.activity.AppStarterActivity")
+        time.sleep(9.0)
+    return not focus_is_ad_activity()
 
 
 # ---- 视觉兜底: 固定坐标点不动时, 让云端多模态模型看图给坐标 ----
@@ -1253,6 +1307,180 @@ def run_draw_round(n):
     return spins
 
 
+# ================= 第 15/16 步: 宝箱 & 定时领金币(都是 5 分钟一轮, 共用同一套金币弹窗) =================
+# 两个任务的共同点(实测):
+#   点下去 -> 「恭喜您获得 X 金币」(直接到账) -> 「翻倍后 Y 金币 / 看广告后可领取」
+#   -> 橙色「浏览5秒再领 Z 金币」 -> 可能是浏览广告, 也可能是门页型广告 -> 底部 ✕ 关闭
+#   领完后按钮变成倒计时(约 5 分钟), 冷却期间点了没反应
+TIMED_TPL = "tpl_timed_row.png"     # 202x49 全分辨率灰度, 内容="定时领金币"
+TIMED_TPL_X = 84
+TIMED_BTN_DY = 22                   # 按钮中心相对模板顶部(实测 2060~2142 中心2101)
+TIMED_BTN_X = 895
+
+
+def find_chest_btn(shot="_fs_chest.png"):
+    """找右下角宝箱下面的「领金币」红色胶囊。宝箱是随机冒出来的浮层, 位置固定但出现时机不定,
+    所以每轮都重新找一次。实测: 红(255,85,86), 胶囊约 226x132, 中心 (927,2095)。"""
+    screencap(shot)
+    a = np.asarray(Image.open(shot).convert("RGB")).astype(np.int16)
+    oh, ow, _ = a.shape
+    x0, y0 = int(0.70 * ow), int(0.78 * oh)
+    reg = a[y0:int(0.97 * oh), x0:ow, :]
+    r, g, b = reg[:, :, 0], reg[:, :, 1], reg[:, :, 2]
+    red = (r > 200) & (g < 115) & (b < 115)
+    rows = red.mean(axis=1)
+    hit = [y for y in range(len(rows)) if rows[y] > 0.45]
+    if not hit:
+        log("[宝箱] 右下角没有红色胶囊")
+        return None
+    seg, cur = [], [hit[0]]
+    for y in hit[1:]:
+        if y - cur[-1] <= 3:
+            cur.append(y)
+        else:
+            seg = cur if len(cur) > len(seg) else seg
+            cur = [y]
+    seg = cur if len(cur) > len(seg) else seg
+    h = seg[-1] - seg[0]
+    if not (50 <= h <= 170):            # 胶囊高度约 130px, 太薄/太厚都不是它
+        log(f"[宝箱] 红色区域高 {h}px, 不像胶囊")
+        return None
+    ys, xs = np.where(red[seg[0]:seg[-1] + 1])
+    xx = [int(v) + x0 for v in xs]
+    cx = sum(xx) // len(xx)
+    cy = (seg[0] + seg[-1]) // 2 + y0
+    log(f"[宝箱] 找到「领金币」胶囊 高{h}px 中心({cx},{cy})")
+    return cx, cy
+
+
+def run_claim_popup(tag=""):
+    """处理「恭喜获得X金币 / 翻倍后Y金币」弹窗: 有橙色按钮就点(可能带广告), 没了就关掉。
+    返回是否走过广告。"""
+    did_ad = False
+    for i in range(4):
+        kind, btn = detect_popup()
+        if not btn:
+            break
+        log(f"[{tag}] 弹窗橙色按钮 ({btn[0]},{btn[1]}) 第{i + 1}次")
+        screencap("_fs_cl_size.png")
+        ow, oh = screen_size("_fs_cl_size.png")
+        if not tap_verified(btn[0], btn[1], wait=2.2):
+            log(f"[{tag}] 点不动, 退出循环")
+            break
+        time.sleep(1.0)
+        if is_door_page():
+            log(f"[{tag}] 这个弹窗广告是门页型 -> 走门页流程")
+            run_ad_once(tag=f"{tag}·广告")
+        elif _screen_dark()[0]:
+            # 13:32 实录: 点击后 WebView 渲染慢, 截到一帧纯黑, 被误判成"浏览型"去左滑,
+            # 结果广告页卡死整轮跑飞。所以黑屏时必须等待重判, 绝不左滑。
+            log(f"[{tag}] 整页黑屏(过渡帧/加载中) -> 等待重判")
+            turned = False
+            for _ in range(4):
+                time.sleep(2.2)
+                dark, _m = _screen_dark()
+                if not dark:
+                    turned = True
+                    break
+            if turned and is_door_page():
+                log(f"[{tag}] 过渡帧后露出门页 -> 走门页流程")
+                run_ad_once(tag=f"{tag}·广告")
+            elif turned:
+                log(f"[{tag}] 过渡帧后不是门页 -> 按浏览型处理")
+                _browse_ad_and_back(tag, ow, oh)
+            else:
+                log(f"[{tag}] 持续黑屏 -> 抢救")
+                if not rescue_from_stuck_ad():
+                    log(f"[{tag}] 抢救失败, 结束本弹窗")
+                    break
+                goto_coin_center()
+        else:
+            _browse_ad_and_back(tag, ow, oh)
+        did_ad = True
+        if not on_coin_center():
+            goto_coin_center()
+    close_popup()
+    return did_ad
+
+
+def _browse_ad_and_back(tag, ow, oh):
+    """浏览型激励广告: 停 5~6s -> 左滑一次 -> 等回金币中心(失败先抢救再导航)。"""
+    log(f"[{tag}] 浏览型广告 -> 停满 5~6s 后左滑")
+    time.sleep(random.uniform(*INCENTIVE_STAY_RANGE))
+    screencap("_fs_cl_pre.png")
+    base = _fp("_fs_cl_pre.png")
+    _adb("shell", "input", "swipe", str(int(ow * 0.99)), str(int(oh * 0.5)),
+         str(int(ow * 0.15)), str(int(oh * 0.5)), "250")
+    time.sleep(1.6)
+    screencap("_fs_cl_post.png")
+    if _dist(base, _fp("_fs_cl_post.png")) < 6.0:
+        log(f"[{tag}] 左滑没生效, 不重滑(避免退出两层)")
+    if not wait_coin_center(timeout=4.0):
+        if focus_is_ad_activity() or not on_coin_center():
+            rescue_from_stuck_ad()
+        goto_coin_center()
+
+
+def run_chest_once(tag="宝箱"):
+    """点右下角宝箱领金币。返回 'ok' 领到 / 'none' 没有宝箱或冷却中。"""
+    log(f"===== {tag} 开始 =====")
+    ensure_in_app()
+    if not on_coin_center() and not goto_coin_center():
+        log(f"[{tag}] 回不到金币中心")
+        return "no_page"
+    if detect_popup()[1]:                 # 先清掉压着的弹窗, 否则点不到宝箱
+        run_claim_popup(tag=f"{tag}·清场")
+    btn = find_chest_btn()
+    if not btn:
+        log(f"[{tag}] 没有宝箱(冷却中/本屏没有) -> 结束")
+        return "none"
+    log(f"[{tag}] 点宝箱 ({btn[0]},{btn[1]})")
+    tap_human(*btn)
+    time.sleep(2.0)
+    if not detect_popup()[1]:
+        log(f"[{tag}] 点完没弹窗 -> 可能已领过")
+        return "none"
+    run_claim_popup(tag=tag)
+    log(f"===== {tag} 结束 =====")
+    return "ok"
+
+
+def run_timed_once(tag="定时领金币", max_scroll=10):
+    """滚到「定时领金币」点「领金币」。冷却期间点了不弹窗 -> 返回 'none'。"""
+    log(f"===== {tag} 开始 =====")
+    ensure_in_app()
+    if not on_coin_center() and not goto_coin_center():
+        log(f"[{tag}] 回不到金币中心")
+        return "no_page"
+    close_popup()
+    for _ in range(5):                    # 回顶部
+        before = "_fs_tt_pre.png"
+        screencap(before)
+        _adb("shell", "input", "swipe", "540", "700", "540", "1750", "400")
+        time.sleep(1.1)
+        screencap("_fs_tt_post.png")
+        if _dist(_fp(before), _fp("_fs_tt_post.png")) < 3.0:
+            break
+    for i in range(max_scroll):
+        btn = _match_text_row(TIMED_TPL, TIMED_TPL_X, "_fs_timed.png",
+                              y_hi=2180, dy=TIMED_BTN_DY, btn_x=TIMED_BTN_X, tag="定时")
+        if btn:
+            log(f"[{tag}] 找到这一行, 点「领金币」({btn[0]},{btn[1]})")
+            tap_verified(btn[0], btn[1], wait=2.2)
+            time.sleep(1.2)
+            if not detect_popup()[1]:
+                log(f"[{tag}] 点了没弹窗 -> 冷却中(每5分钟一次)")
+                return "none"
+            run_claim_popup(tag=tag)
+            log(f"===== {tag} 结束 =====")
+            return "ok"
+        log(f"[{tag}] 第{i + 1}次下滚找「定时领金币」")
+        _adb("shell", "input", "swipe", "540", "1700", "540", "900", "450")
+        time.sleep(1.2)
+    log(f"[{tag}] 没找到「定时领金币」这一行")
+    return "notfound"
+
+
 if __name__ == "__main__":
     import sys
 
@@ -1305,3 +1533,10 @@ if __name__ == "__main__":
                 run_draw_round(i)
             except Exception as e:
                 log(f"[抽奖-{i}] 异常: {type(e).__name__}: {e}")
+    elif step == "15":           # 右下角宝箱领金币
+        run_chest_once()
+    elif step == "16":           # 定时领金币(每5分钟)
+        run_timed_once()
+    elif step == "17":           # 两个 5 分钟任务各跑一次(轮询脚本用)
+        run_chest_once()
+        run_timed_once()
