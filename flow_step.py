@@ -508,6 +508,46 @@ def find_orange_btn(shot="_fs_scan.png", y_top=850, y_bottom=1580, x_rel=500):
     return (x0 + x1) // 2, (y1 + y2) // 2
 
 
+def find_red_btn(shot="_fs_red.png", y_top=1300, y_bottom=1750):
+    """扫屏幕中轴线找"红色按钮"(挽留窗「点击立即浏览」, 实测 RGB≈(232,78,68))。
+    区分于橙色激励按钮: 红色 r>200 且 g<110 且 b<110 (橙色 g 会更高)。
+    挽留窗特征: "现在退出就没有奖励哦" 弹窗, 红色按钮在上、灰色"放弃奖励"在下。
+    返回中心像素坐标或 None。"""
+    screencap(shot)
+    with Image.open(shot) as im:
+        im = im.convert("RGB")
+        ow, oh = im.size
+        x0, x1 = int(0.30 * ow), int(0.70 * ow)      # 按钮横向范围
+        xs = list(range(x0, x1, 8))
+        rows = []
+        for y in range(y_top, y_bottom, 4):
+            cnt = 0
+            for x in xs:
+                r, g, b = im.getpixel((x, y))
+                if r > 200 and g < 115 and b < 115:   # 红色(挽留窗立即浏览)
+                    cnt += 1
+            if cnt / len(xs) > 0.5:
+                rows.append(y)
+    if not rows:
+        log("[红色按钮扫描] 未找到(无挽留窗)")
+        return None
+    # 取最长连续段
+    best, cur = [], [rows[0]]
+    for y in rows[1:]:
+        if y - cur[-1] <= 8:
+            cur.append(y)
+        else:
+            best = cur if len(cur) > len(best) else best
+            cur = [y]
+    best = cur if len(cur) > len(best) else best
+    y1, y2 = best[0], best[-1]
+    if y2 - y1 < 30:
+        log(f"[红色按钮扫描] 命中但太矮 ({y1}~{y2}), 视为未找到")
+        return None
+    log(f"[红色按钮扫描] 命中挽留窗'立即浏览' y={y1}~{y2} -> 中心 ({(x0 + x1) // 2},{(y1 + y2) // 2})")
+    return (x0 + x1) // 2, (y1 + y2) // 2
+
+
 def on_coin_center(shot="_fs_cc.png"):
     """是否在金币中心。两种外观都要认:
     A) 有弹窗: 整屏被遮罩压暗, 四边底色稳定 RGB≈(98,99,100)(实测 9/9 命中)
@@ -759,8 +799,10 @@ def detect_popup(shot="_fs_pop2.png"):
 
 def is_door_page(shot="_fs_door.png", use_existing=False):
     """门页/广告页判定: 顶部有一条暗色提示条(写着"点击后浏览15秒"/"已观看广告15秒｜退出"等)。
-    黑条 y 位置不固定(实测 100~320 之间都会出现), 所以扫一整段找连续暗带;
-    并且要求"暗带下方不是暗的" —— 否则夜间模式的整页深色会被误判成广告页。"""
+    黑条 y 位置不固定(实测 100~320 之间都会出现), 所以扫一整段找连续暗带。
+    2026-11-03 修复: 深色素材门页(顶部暗带+下方深色素材)曾被误判成"不是门页",
+    导致不点CTA白等、点✕假关、弹挽留窗弃奖卡死。顶部暗带是门页强特征, 下方暗不再排除——
+    夜间模式整页深色由调用方(handle_ad)按"是否已进广告Activity"区分。"""
     if not use_existing:
         screencap(shot)
     a = np.asarray(Image.open(shot).convert("RGB")).astype(np.int16)
@@ -777,9 +819,9 @@ def is_door_page(shot="_fs_door.png", use_existing=False):
     y1 = rows[-1]
     below = min(oh - 1, y1 + 80)
     c_below = sum(1 for x in xs if int(a[below, x].sum()) < 200) / len(xs)
-    ok = c_below < 0.4
-    log(f"[门页判定] 暗带 y={rows[0]}~{y1}, 其下暗度 {c_below:.0%} -> {'是门页' if ok else '不是门页(整页深色)'}")
-    return ok
+    log(f"[门页判定] 暗带 y={rows[0]}~{y1}, 其下暗度 {c_below:.0%} -> 是门页"
+        f"({'深色素材' if c_below >= 0.4 else '亮色素材'})")
+    return True
 
 
 def is_plain_door(shot="_fs_doorplain.png", use_existing=False):
@@ -958,10 +1000,19 @@ def _handle_video_reward(ow, oh, tag, check=None):
         time.sleep(6)
     if check():
         return True
+    # 看完视频后常见"现在退出就没有奖励"挽留窗(红「点击立即浏览」+ 灰「放弃奖励」):
+    # 正确 = 点红色完成浏览, 绝不能点灰色(弃奖)。先查挽留窗再退出。
+    if find_red_btn():
+        log(f"[广告{tag}] 视频看完弹挽留窗 -> 走'立即浏览'流程")
+        return _handle_retention_popup(ow, oh, tag, check=check)
     log(f"[广告{tag}] 点顶部「退出」退出视频页")
     tap_human(int(0.622 * ow), int(0.0888 * oh))     # 顶部黑条右侧"退出" (实测 672,213)
     if wait_coin_center(timeout=8.0, check=check):
         return True
+    # 点"退出"后也可能再弹挽留窗
+    if find_red_btn():
+        log(f"[广告{tag}] 点退出后弹挽留窗 -> 走'立即浏览'流程")
+        return _handle_retention_popup(ow, oh, tag, check=check)
     if _try_door_exit(ow, oh, tag, DOOR_EXIT_CANDIDATES, check=check):
         return True
     return _rescue_giveup(ow, oh, tag, check=check)
@@ -982,6 +1033,36 @@ def _rescue_giveup(ow, oh, tag, check=None):
     return False
 
 
+def _handle_retention_popup(ow, oh, tag, check=None):
+    """挽留窗「点击立即浏览」(2026-11-03 实测, 30s视频看完后常见):
+    粉色哭泣礼盒弹窗 "现在退出就没有奖励哦" + 红色「点击立即浏览」+ 灰色「放弃奖励」。
+    正确动作 = 点红色「点击立即浏览」-> 进京东落地页浏览 15s -> 退出(✕/左滑/BACK)。
+    绝不能点灰色「放弃奖励」(弃奖不计数, 之前每次死在这里)。
+    返回是否回到目标页。"""
+    check = check or on_coin_center
+    btn = find_red_btn()
+    if not btn:
+        log(f"[广告{tag}] 无红色'立即浏览'按钮 -> 按普通挽留窗处理")
+        return _rescue_giveup(ow, oh, tag, check=check)
+    log(f"[广告{tag}] 挽留窗'立即浏览' ({btn[0]},{btn[1]}) -> 点它完成浏览")
+    tap_human(btn[0], btn[1])
+    time.sleep(3.0)
+    if check():
+        log(f"[广告{tag}] 点'立即浏览'后直接回目标页")
+        return True
+    # 进落地页浏览 15s(规则要求)
+    log(f"[广告{tag}] 已进落地页, 浏览 15s")
+    time.sleep(16.0)
+    if check():
+        return True
+    # 退出链: 左上✕ -> 左滑 -> 系统BACK -> 视觉兜底(复用 _close_landing_x)
+    if _close_landing_x(ow, oh, tag, check=check):
+        return True
+    if _try_door_exit(ow, oh, tag, DOOR_EXIT_CANDIDATES, check=check):
+        return True
+    return _rescue_giveup(ow, oh, tag, check=check)
+
+
 def _handle_plain_door(ow, oh, tag, check=None):
     """纯白说明型门页: 没有 CTA 可点, 停满 15s 平台就发奖励。
     出口优先黑条"退出"(实测 599,222), 跳过素材型右上角✕(纯白型没有, 每次白等 1.8s)。"""
@@ -994,15 +1075,20 @@ def _handle_plain_door(ow, oh, tag, check=None):
 
 def _handle_material_door(ow, oh, tag, check=None):
     """素材型门页: 点 CTA 跳落地页 -> 浏览满 15s -> 落地页✕ -> 门页出口。
-    CTA 点不动时退化为"纯白型"处理(停满直接找出口, 不硬点)。"""
+    2026-11-03 修复: CTA 点不动时先查倒计时圆圈 —— 有圆圈=视频型广告(顶部黑条"已观看"也有暗带,
+    被 is_door_page 归到门页, 实际是视频), 走视频型等待; 无圆圈才按纯白型处理。"""
     check = check or on_coin_center
     landed = tap_door_cta(ow, oh, tag)
-    _ad_stay(tag)
     if not landed:
-        log(f"[广告{tag}] CTA 没点动, 视为停在门页, 直接找门页出口")
+        if _countdown_running():
+            log(f"[广告{tag}] CTA 点不动且有倒计时圆圈 -> 实为视频型广告, 降级视频流程")
+            return _handle_video_reward(ow, oh, tag, check=check)
+        log(f"[广告{tag}] CTA 没点动且无倒计时圆圈, 视为纯白型门页, 直接找门页出口")
+        _ad_stay(tag)
         if _try_door_exit(ow, oh, tag, DOOR_EXIT_CANDIDATES, check=check):
             return True
         return _rescue_giveup(ow, oh, tag, check=check)
+    _ad_stay(tag)
     if _close_landing_x(ow, oh, tag, check=check):
         return True
     if _try_door_exit(ow, oh, tag, DOOR_EXIT_CANDIDATES, check=check):
