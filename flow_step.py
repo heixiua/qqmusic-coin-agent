@@ -843,6 +843,7 @@ def tap_door_cta(ow, oh, tag=""):
 AD_FORM_PLAIN_DOOR = "纯白说明型门页"
 AD_FORM_MATERIAL_DOOR = "素材型门页"
 AD_FORM_LANDING_PAGE = "落地页ADActivity"
+AD_FORM_VIDEO = "视频倒计时型TMECore"
 AD_FORM_UNKNOWN = "未知形态"
 
 # 出口候选排序差异:
@@ -904,6 +905,41 @@ def _ad_stay(tag):
     stay = random.uniform(*AD_STAY_RANGE)
     log(f"[广告{tag}] 广告页停留 {stay:.2f}s")
     time.sleep(stay)
+
+
+def _countdown_running():
+    """视频右上角倒计时圆圈是否还在(观看中亮像素~4%, 看完圆圈消失区域变纯黑<1%)。
+    视频长度不定(实测 15s / 30s), 不能写死停留——用圆圈判断"看完没有"才可靠。
+    若某视频没有倒计时圆圈, 这里返回 False -> 立即按已看完处理(正确降级)。"""
+    screencap("_fs_cd.png")
+    a = np.asarray(Image.open("_fs_cd.png").convert("L")).astype(np.float32)
+    roi = a[170:265, 930:1070]          # 倒计时圆圈区域(右上角, 标定 2026-11-03)
+    return float((roi > 120).mean()) > 0.02
+
+
+def _handle_video_reward(ow, oh, tag):
+    """视频倒计时型(前台 TMECore): 视频长度不定(15s/30s), 看满才给奖。
+    解法 = 常规停留 16~18.5s(覆盖多数15s) -> 轮询倒计时圆圈, 消失才算看完
+    -> 点顶部「退出」-> 出口链 -> 挽留窗。
+    2026-11-03 教训: 30s 视频只等 17.5s 就去点"退出", 全部无效, 还误入抢救把奖励丢了。"""
+    _ad_stay(tag)
+    for i in range(6):                      # 再给最多 ~36s, 覆盖 30s 长视频
+        if on_coin_center():
+            return True
+        if not _countdown_running():
+            log(f"[广告{tag}] 倒计时圆圈已消失(第{i + 1}次检测) -> 视频看完")
+            break
+        log(f"[广告{tag}] 倒计时还在走, 再等 6s (第{i + 1}次)")
+        time.sleep(6)
+    if on_coin_center():
+        return True
+    log(f"[广告{tag}] 点顶部「退出」退出视频页")
+    tap_human(int(0.622 * ow), int(0.0888 * oh))     # 顶部黑条右侧"退出" (实测 672,213)
+    if wait_coin_center(timeout=8.0):
+        return True
+    if _try_door_exit(ow, oh, tag, DOOR_EXIT_CANDIDATES):
+        return True
+    return _rescue_giveup(ow, oh, tag)
 
 
 def _rescue_giveup(ow, oh, tag):
@@ -970,6 +1006,7 @@ AD_HANDLERS = {
     AD_FORM_PLAIN_DOOR: _handle_plain_door,
     AD_FORM_MATERIAL_DOOR: _handle_material_door,
     AD_FORM_LANDING_PAGE: _handle_landing_page,
+    AD_FORM_VIDEO: _handle_video_reward,
     AD_FORM_UNKNOWN: _handle_unknown_ad,
 }
 
@@ -990,7 +1027,12 @@ def handle_ad(tag="", entry_shot="_fs_entry.png"):
         else:
             form = AD_FORM_MATERIAL_DOOR
     else:
-        form = AD_FORM_LANDING_PAGE
+        # 非门页: 看前台 Activity 区分"视频倒计时型"(TMECore) 与"落地页"(ADActivity)
+        focus = _current_focus_name()
+        if "TMECore" in focus or "tmead" in focus.lower():
+            form = AD_FORM_VIDEO
+        else:
+            form = AD_FORM_LANDING_PAGE
         ow, oh = screen_size(entry_shot)
 
     log(f"[广告{tag}] 形态={form}")
