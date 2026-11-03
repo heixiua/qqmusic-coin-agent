@@ -1767,6 +1767,135 @@ def run_lottery_round(n, max_draw=LOTTERY_MAX_DRAW):
     return done
 
 
+# ================= 第 20 步: 四任务全跑调度器(干净版, 2026-11-03 从 stash 设计恢复) =================
+# 设计依据(用户确认过的串联规则 + 交接文档纪律):
+#   - 调度顺序: 看视频领金币(12) -> 看视频得高额金币(13) -> 抽奖赢金币(14) -> 金币抽奖(18)
+#   - 任务间必须清弹窗、确保回金币中心, 再进下一个任务(否则弹窗吃掉手势)
+#   - 连续 2 轮无进展 = 该任务次数用完, 早停, 不硬跑
+#   - 宝箱/定时(15/16) 不并入本调度: D9 铁律, 它们会弹窗打断广告流程, 保持 step17 单独轮询
+#   - 汇总只打印控制台, 不写文件(用户偏好: 日志仅控制台)
+# 用法: python flow_step.py 20 [任务1轮数] [任务2轮数]   (默认 5 3)
+
+
+def _rec(results, task, status, count, reason):
+    """记录一个任务的最终状态并打印。"""
+    results.append({"task": task, "status": status, "count": count, "reason": reason})
+    log(f"[最终] {task}: {status} | {count} 次 | {reason}")
+
+
+def _drain_popup_sched(tag):
+    """任务间清场: 只有此刻真的检测到弹窗才关, 不在干净页把任务行橙色按钮当弹窗关掉。"""
+    kind, _ = detect_popup()
+    if kind:
+        log(f"[调度·{tag}] 收尾弹窗={kind} -> 关掉再进下一个任务")
+        close_popup()
+    else:
+        log(f"[调度·{tag}] 无收尾弹窗")
+
+
+def _run_one_task(results, task, n_rounds, run_func, name):
+    """跑一个任务 n 轮, 连续 2 轮无进展即早停。返回完成轮数。"""
+    fail, done = 0, 0
+    for i in range(1, n_rounds + 1):
+        try:
+            r = run_func(i)
+        except Exception as e:
+            log(f"[{name}-{i}] 异常 {type(e).__name__}: {e}")
+            r = None
+        if r is None:
+            fail += 1
+            log(f"[调度] {name} 第{i}轮无进展 {fail}/2")
+            if fail >= 2:
+                _rec(results, task, "DONE(连续2轮无进展)", done, f"第{i}轮起早停")
+                return done
+        else:
+            done += 1
+            fail = 0
+    _rec(results, task, "DONE(跑满设定轮数)", done, f"{n_rounds}轮")
+    return done
+
+
+def scroll_find_task2(max_scroll=6):
+    """从当前位置一屏一屏下滑, 找「看视频得高额金币」那一行(不回顶部, 省时间)。
+    滑不动 = 有弹窗压着把滚动手势吃掉, 先关弹窗; 全都不行再回顶部逐屏兜底。"""
+    btn = find_task2_row()
+    if btn:
+        return btn
+    for i in range(max_scroll):
+        pre, post = "_fs_chain_pre.png", "_fs_chain_post.png"
+        screencap(pre)
+        log(f"[调度] 第{i + 1}次下滚找任务2")
+        _adb("shell", "input", "swipe", "540", "1700", "540", "800", "450")
+        time.sleep(0.9)          # WebView 滚动惯性短, 0.9s 足够(实测, 1.3s 纯空等)
+        screencap(post)
+        btn = find_task2_row()
+        if btn:
+            return btn
+        if _dist(_fp(pre), _fp(post)) < 3.0:
+            log("[调度] 滑不动 -> 有弹窗压着手势, 先关弹窗")
+            if not close_popup():
+                break
+    log("[调度] 下滚没找到 -> 回顶部逐屏兜底")
+    return ensure_task2_row()
+
+
+def run_all_daily_tasks(n1=5, n2=3):
+    """四任务全跑: 看视频领金币 -> 看视频得高额金币 -> 抽奖赢金币 -> 金币抽奖。
+    每任务结束清弹窗回金币中心再进下一个; 汇总打印控制台(不写文件)。"""
+    results = []
+    log("===== 四任务全跑调度开始 =====")
+    ensure_in_app()
+    if not on_coin_center():
+        goto_coin_center()
+    _drain_popup_sched("前置")
+
+    # ---------- 任务1: 看视频领金币 ----------
+    log("########## 任务1: 看视频领金币 ##########")
+    _run_one_task(results, "看视频领金币", n1, run_round, "T1")
+    _drain_popup_sched("任务1后")
+
+    # ---------- 任务2: 看视频得高额金币(需下滑找行) ----------
+    log("########## 任务2: 看视频得高额金币 ##########")
+    btn = scroll_find_task2()
+    if not btn:
+        _rec(results, "看视频得高额金币", "STOPPED(找不到行)", 0, "下滑后仍找不到任务行")
+    else:
+        log(f"[调度] 任务2入口 ({btn[0]},{btn[1]})")
+        _run_one_task(results, "看视频得高额金币", n2, run_task2_round, "T2")
+        _drain_popup_sched("任务2后")
+
+    # ---------- 任务3: 抽奖赢金币(老虎机, 内部跑到10次或明天再来) ----------
+    log("########## 任务3: 抽奖赢金币 ##########")
+    try:
+        spins = run_draw_round(1)
+    except Exception as e:
+        log(f"[抽奖] 异常 {type(e).__name__}: {e}")
+        spins = None
+    if spins is None:
+        _rec(results, "抽奖赢金币", "STOPPED(进不去抽奖页)", 0, "ensure_draw_page 失败")
+    elif spins >= DRAW_MAX_SPINS:
+        _rec(results, "抽奖赢金币", "CAPPED(达每日上限)", spins, f"跑满{DRAW_MAX_SPINS}次")
+    else:
+        _rec(results, "抽奖赢金币", "DONE(明天再来)", spins, "主按钮无反应=次数用完")
+
+    # ---------- 任务4: 金币抽奖(九宫格, 内部跑到10次或抽奖格消失) ----------
+    log("########## 任务4: 金币抽奖 ##########")
+    try:
+        ldone = run_lottery_round(1, max_draw=LOTTERY_MAX_DRAW)
+    except Exception as e:
+        log(f"[金币抽奖] 异常 {type(e).__name__}: {e}")
+        ldone = None
+    if ldone is None:
+        _rec(results, "金币抽奖", "STOPPED(找不到模块)", 0, "ensure_lottery_module 失败")
+    elif ldone >= LOTTERY_MAX_DRAW:
+        _rec(results, "金币抽奖", "CAPPED(达每日上限)", ldone, f"跑满{LOTTERY_MAX_DRAW}次")
+    else:
+        _rec(results, "金币抽奖", "DONE(抽奖格消失)", ldone, "看广告抽奖格消失或点不动")
+
+    log("===== 四任务全部执行完毕 =====")
+    return results
+
+
 if __name__ == "__main__":
     import sys
 
@@ -1834,3 +1963,7 @@ if __name__ == "__main__":
                 run_lottery_round(i, max_draw=max_draw)
             except Exception as e:
                 log(f"[金币抽奖-{i}] 异常: {type(e).__name__}: {e}")
+    elif step == "20":           # 四任务全跑: 看视频领金币+高额+抽奖+金币抽奖
+        n1 = int(sys.argv[2]) if len(sys.argv) > 2 else 5
+        n2 = int(sys.argv[3]) if len(sys.argv) > 3 else 3
+        run_all_daily_tasks(n1, n2)
