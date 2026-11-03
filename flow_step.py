@@ -2257,7 +2257,10 @@ if __name__ == "__main__":
         n_rounds = int(sys.argv[2]) if len(sys.argv) > 2 else 3
         for i in range(1, n_rounds + 1):
             try:
-                run_round(i)
+                r = run_round(i)
+                if r == TASK_DONE:
+                    log(f"[第{i}轮] 收到任务完成信号(入口消失/刷完) -> 停止, 不再跑满{n_rounds}轮")
+                    break
             except Exception as e:
                 log(f"[第{i}轮] 异常: {type(e).__name__}: {e}")
     elif step == "13":           # 看视频得高额金币(每日任务)循环
