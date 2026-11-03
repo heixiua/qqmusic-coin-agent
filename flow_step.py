@@ -466,12 +466,15 @@ def _is_orange(px):
     return r > 190 and 70 < g < 180 and b < 95
 
 
-def find_orange_btn(shot="_fs_scan.png", y_top=850, y_bottom=1580, x_rel=500):
+def find_orange_btn(shot="_fs_scan.png", y_top=850, y_bottom=1520, x_rel=500):
     """扫屏幕中轴线, 找橙色按钮的纵向范围并返回中心 (x,y); 找不到返回 None。
     为什么要扫: 金币中心有两种弹窗, 按钮高度不一样——
       A) 激励弹窗「浏览5秒再领XXX金币」→ 按钮 y≈1245
       B) 观看完成「观看下一条」        → 按钮 y≈1400
-    写死一个坐标会漏掉另一种。"""
+    写死一个坐标会漏掉另一种。
+    2026-11-03 修复: y_bottom 从 1580 缩到 1520——页面自身的橙色按钮
+    (看视频 y≈1644 / 看广告抽奖 y≈1680) 曾被误判成弹窗, close_popup 会
+    点 (545,1680) 误进"看广告抽奖"广告。弹窗按钮恒在 y<1500, 页面按钮恒 >1600。"""
     screencap(shot)
     with Image.open(shot) as im:
         im = im.convert("RGB")
@@ -1782,7 +1785,7 @@ def run_timed_once(tag="定时领金币", max_scroll=10):
 LOTTERY_FREE_TPL = "tpl_lottery_free.png"
 LOTTERY_DRAW_TPL = "tpl_lottery_draw.png"
 LOTTERY_BROWSE_CTA_REL = (500, 896)   # 浏览型广告: 底部「点击浏览15秒」蓝字 (实测 540,2150)
-LOTTERY_TPL_X = 385                 # 模板在屏上的固定 x 起点(橙块恒在 x≈402-675)
+LOTTERY_TPL_X = 455                 # 模板在屏上的固定 x 起点(2026-11-03 实测按钮 x≈469-607, 模板裁剪自 x=455)
 LOTTERY_MAX_DRAW = 10               # 每日上限(页面写 10 次)
 
 
@@ -1941,17 +1944,47 @@ def lottery_ad_exit(ow, oh, tag=""):
     return not focus_is_ad_activity()
 
 
+def is_lottery_result_popup(shot="_fs_lotres.png"):
+    """抽奖结果弹窗专用检测: 底部按钮红色「观看视频再抽1次」或灰色「明日再来」。
+    实测: 还有次数时按钮红色(y≈1517-1589 红色占比62%); 次数用完时按钮灰色
+    (y≈1517-1577 灰色占比100%)——灰色=结束信号(明日再来)。
+    为什么不用 detect_popup: 它只找橙色按钮(y<1520), 抽奖结果按钮是红/灰色
+    (在 y>1500), 会被漏检 -> 等弹窗 15s 白等 -> 误判"次数用完"。
+    返回: None=未命中 / 'draw'=还能抽(红色按钮) / 'done'=次数用完(灰色按钮)。"""
+    screencap(shot)
+    a = np.asarray(Image.open(shot).convert("RGB")).astype(np.int16)
+    oh, ow, _ = a.shape
+    y0, y1 = int(1480 / 2400 * oh), int(1650 / 2400 * oh)
+    x0, x1 = int(300 / 1080 * ow), int(760 / 1080 * ow)
+    reg = a[y0:y1, x0:x1]
+    red = ((reg[:, :, 0] > 170) & (reg[:, :, 1] < 110) & (reg[:, :, 2] < 110))
+    gray = ((np.abs(reg[:, :, 0] - reg[:, :, 1]) < 20) &
+            (np.abs(reg[:, :, 1] - reg[:, :, 2]) < 20) & (reg[:, :, 0] > 120))
+    r_ratio = float(red.mean())
+    g_ratio = float(gray.mean())
+    if r_ratio > 0.5:
+        log(f"[抽奖结果检测] 红色按钮占比 {r_ratio:.0%} -> 命中(draw,还能抽)")
+        return "draw"
+    if g_ratio > 0.5:
+        log(f"[抽奖结果检测] 灰色按钮占比 {g_ratio:.0%} -> 命中(done,次数用完)")
+        return "done"
+    log(f"[抽奖结果检测] 红 {r_ratio:.0%} 灰 {g_ratio:.0%} -> 未命中")
+    return None
+
+
 def lottery_close_result(tag=""):
-    """关掉抽奖结果弹窗: 先点底部圆形✕(相对500,788), 不行再视觉兜底。"""
+    """关掉抽奖结果弹窗: 先点底部圆形✕(相对500,788), 不行再视觉兜底。
+    返回: True=已关闭 / 'done'=检测到'明日再来'(次数用完, 已关闭)。"""
     screencap("_fs_lot_rsize.png")
     ow, oh = screen_size("_fs_lot_rsize.png")
     tap_human(int(500 / 1000 * ow), int(788 / 1000 * oh))
     time.sleep(1.5)
-    if not detect_popup()[1]:
+    kind = is_lottery_result_popup()
+    if kind is None:
         return True
-    tap_by_vision(target="中奖弹窗的关闭✕或『开心收下』按钮", tag=f"-LOTOK{tag}")
+    tap_by_vision(target="中奖弹窗的关闭✕或『开心收下』/『明日再来』按钮", tag=f"-LOTOK{tag}")
     time.sleep(1.5)
-    return not detect_popup()[1]
+    return "done" if is_lottery_result_popup() == "done" else True
 
 
 def lottery_free_once(tag="金币抽奖·免费"):
@@ -2001,7 +2034,7 @@ def lottery_draw_once(tag=""):
         if focus_is_ad_activity():
             ad = True
             break
-        if detect_popup()[1]:
+        if is_lottery_result_popup():
             lottery_close_result(tag)
             return True
         time.sleep(1.0)
@@ -2021,9 +2054,10 @@ def lottery_draw_once(tag=""):
         time.sleep(2.5)
     # 等结果弹窗
     for _ in range(10):
-        if detect_popup()[1]:
+        kind = is_lottery_result_popup()
+        if kind:
             lottery_close_result(tag)
-            return True
+            return kind != "done"   # done=次数用完(明日再来), 仍算抽到了
         time.sleep(1.5)
     log(f"[金币抽奖·{tag}] 等不到结果弹窗 -> 判定次数用完/结束")
     return False
