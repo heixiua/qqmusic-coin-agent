@@ -660,8 +660,15 @@ def ensure_task2_row(max_scroll=8):
         if btn:
             return btn
         log(f"[任务行] 第{i + 1}次下滚查找")
+        screencap("_fs_scr_pre.png")
         _adb("shell", "input", "swipe", "540", "1700", "540", "800", "450")
         time.sleep(1.3)
+        screencap("_fs_scr_post.png")
+        if _dist(_fp("_fs_scr_pre.png"), _fp("_fs_scr_post.png")) < 3.0:
+            # 滑不动 = 有弹窗盖着把滚动手势吃掉了; 不查出来就会白滚 8 次然后放弃
+            log("[任务行] 滑不动 -> 判定有弹窗压着, 先关弹窗")
+            if not close_popup():
+                return None
     return find_task2_row()
 
 
@@ -723,8 +730,13 @@ def is_plain_door(shot="_fs_doorplain.png"):
     return ok
 
 
-# 门页的关闭入口候选: 右上角✕(素材型) / 顶部黑条右侧"退出"(纯白说明型)
-DOOR_EXIT_CANDIDATES = [(922, 110), (556, 93), (622, 89)]
+# 门页/广告页的关闭入口候选(按命中概率排):
+#   (922,110) 素材型门页右上角✕   (实测 999,261)
+#   (556,93)  黑条右侧"退出"      (实测 599,228)
+#   (622,89)  黑条右侧"退出"偏右  (实测 672,214 / 675,206 / 663,216)
+#   (438,93)  插屏广告黑条"跳过"  (实测 473,222)
+#   (500,659) 插屏广告"关闭广告"灰字 (实测 540,1582)
+DOOR_EXIT_CANDIDATES = [(922, 110), (556, 93), (622, 89), (438, 93), (500, 659)]
 
 
 def tap_door_cta(ow, oh, tag=""):
@@ -918,13 +930,16 @@ def run_round(n):
     return end_kind
 
 
-# 弹窗底部圆形 ✕ 的几个已知位置(不同弹窗高度不同; 依次试, 关掉就停)
-POPUP_CLOSE_POS = [(545, 1680), (540, 1572), (540, 2013)]
+# 弹窗底部圆形 ✕ 的已知位置(弹窗高度不同, 依次试, 关掉就停)
+#   (545,1680) 普通"观看下一条"弹窗  (540,2064) "恭喜获得XXX金币"高弹窗(实测)
+POPUP_CLOSE_POS = [(545, 1680), (540, 2064), (540, 1572), (540, 2013)]
+POPUP_CLOSE_TARGET = ("弹窗上用来关闭它的按钮或文字(优先圆形✕; 也可能是"
+                      "'关闭'/'关闭广告'/'暂不领取'/'残忍拒绝'这类文字)")
 
 
 def close_popup():
     """金币中心只要有弹窗就先把它们关掉(否则弹窗会吃掉滑动手势, 页面滚不动)。
-    返回是否已无弹窗。"""
+    先试已知位置, 都不行再让模型找关闭按钮。返回是否已无弹窗。"""
     if not find_orange_btn():
         return True
     log("[弹窗] 检测到弹窗, 先关闭(否则页面无法滚动)")
@@ -934,7 +949,13 @@ def close_popup():
         if not find_orange_btn():
             log("[弹窗] 已关闭")
             return True
-    log("[弹窗] 三个候选位置都没关掉")
+    log("[弹窗] 已知位置都没关掉 -> 视觉兜底找关闭按钮")
+    if tap_by_vision(target=POPUP_CLOSE_TARGET, tag="-POPUP"):
+        time.sleep(1.2)
+        if not find_orange_btn():
+            log("[弹窗] 视觉兜底关掉了")
+            return True
+    log("[弹窗] 仍有关不掉的弹窗")
     return False
 
 
