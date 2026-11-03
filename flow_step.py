@@ -123,6 +123,18 @@ def back():
     log("  按 BACK")
 
 
+def swipe_left(ow=None, oh=None, duration=250):
+    """左滑(系统返回/翻页手势)。实测比系统 BACK 好用: 广告落地页的✕是假关,
+    BACK 有时被广告页吃掉, 左滑=系统返回更可靠(激励链验证过)。ow/oh 为空时从截屏取。"""
+    if ow is None or oh is None:
+        screencap(TMP)
+        with Image.open(TMP) as im:
+            ow, oh = im.size
+    _adb("shell", "input", "swipe", str(int(ow * 0.99)), str(int(oh * 0.5)),
+         str(int(ow * 0.15)), str(int(oh * 0.5)), str(duration))
+    log("  左滑")
+
+
 def focus_package():
     out = _adb("shell", "dumpsys window | grep -E 'mCurrentFocus|mFocusedApp'")
     m = re.search(r"([a-zA-Z][\w.]+)/[\w.$]+", out)
@@ -786,13 +798,44 @@ def ensure_task2_row(max_scroll=8):
 #   门页: 停 1~1.5s -> 点底部「点击浏览15秒」
 #   广告: 停 15.5~16s -> 点左上「✕」-> 回门页(恭喜已获得奖励) -> 点右上「✕」-> 金币中心
 #   激励: 停 5.5~6s -> 左滑 -> 金币中心; 链式最多 3 次
+def _is_limit_wait_popup(shot="_fs_pop2.png"):
+    """频繁限制弹窗识别(2026-11-03 新增):
+    刷广告太频繁时, QQ音乐弹"等待期间看广告额外领金币 / 倒计时00:00后继续开宝箱 /
+    看视频+100金币"——橙色按钮 y≈1434, 会被 detect_popup 误判成 next_video 去点,
+    误进未知广告。识别特征 = 弹窗上部两行文字(长句标题"等待期间看广告额外领金币"
+    + 第二行"倒计时…"), 位置 y≈1140~1300 像素、x 0.19~0.79 宽, 暗像素密度明显。
+    实测(2400高): 标题行暗 13.1%, 第二行区域 4.4%; 普通弹窗该区域无此密度。"""
+    a = np.asarray(Image.open(shot).convert("RGB")).astype(np.int16)
+    oh, ow, _ = a.shape
+    reg1 = a[int(0.475 * oh):int(0.517 * oh), int(0.19 * ow):int(0.79 * ow)]
+    dark1 = float(((reg1.sum(axis=2) < 400) & (reg1.max(axis=2) < 200)).mean())
+    reg2 = a[int(0.517 * oh):int(0.542 * oh), int(0.19 * ow):int(0.79 * ow)]
+    dark2 = float(((reg2.sum(axis=2) < 400) & (reg2.max(axis=2) < 200)).mean())
+    ok = dark1 > 0.10 and dark2 > 0.03
+    if ok:
+        log(f"[弹窗] 频繁限制弹窗特征命中(标题行暗{dark1:.1%}, 第二行暗{dark2:.1%})")
+    return ok
+
+
 def detect_popup(shot="_fs_pop2.png"):
     """返回 (类型, 按钮坐标) 或 (None, None)。类型: incentive / next_video
-    两种弹窗按钮高度不同(激励≈1245, 观看完成≈1400), 用扫描到的 y 区分。"""
+    两种弹窗按钮高度不同(激励≈1245, 观看完成≈1400), 用扫描到的 y 区分。
+    2026-11-03: 频繁限制弹窗(等待期间看广告额外领金币)按钮 y≈1434 会被误判成
+    next_video 去点, 误进未知广告 -> 命中特征时自动点关闭✕(540,1680)退出, 返回 None。"""
     btn = find_orange_btn(shot=shot)
     if not btn:
         return None, None
     kind = "incentive" if btn[1] < 1320 else "next_video"
+    if kind == "next_video" and _is_limit_wait_popup(shot):
+        log(f"[弹窗] 频繁限制弹窗 -> 点关闭✕(540,1680)退出, 不进广告")
+        tap_human(545, 1680)
+        time.sleep(1.6)
+        screencap(shot)
+        if not find_orange_btn(shot=shot):
+            log("[弹窗] 频繁限制弹窗已关闭")
+            return None, None
+        log("[弹窗] 频繁限制弹窗关闭失败, 按next_video处理(视觉兜底)")
+        return kind, btn
     log(f"[弹窗] 类型={kind} 按钮={btn}")
     return kind, btn
 
@@ -1251,7 +1294,9 @@ def run_round(n):
     ok = run_ad_once(tag=f"R{n}")
     end_kind = run_incentive_chain(max_n=6, tag=f"R{n}") if ok else None
     log(f"===== 第 {n} 轮结束, 回金币中心={ok}, 当前弹窗={end_kind} =====")
-    return end_kind
+    # 2026-11-03 修复: 之前 return end_kind, 无弹窗时返回 None 被 _run_one_task 误判"无进展"
+    # (连续2轮无进展保险丝早停)。ok=True 即本轮有进展, 必须返回非 None; 只有广告没退回来才 None。
+    return True if ok else None
 
 
 # 弹窗底部圆形 ✕ 的已知位置(弹窗高度不同, 依次试, 关掉就停)
@@ -1332,7 +1377,7 @@ def run_task2_round(n):
         log(f"[T2-{n}] 退出后已自动弹激励, 直接走链")
         end_kind = run_incentive_chain(max_n=6, tag=f"T2-{n}")
         log(f"===== T2 第 {n} 轮结束, 当前弹窗={end_kind} =====")
-        return end_kind
+        return True
     btn = ensure_task2_row()
     if btn:
         log(f"[T2-{n}] 点「领金币」({btn[0]},{btn[1]})")
@@ -1342,7 +1387,7 @@ def run_task2_round(n):
         log(f"[T2-{n}] 回来后找不到任务行")
     end_kind = run_incentive_chain(max_n=6, tag=f"T2-{n}")
     log(f"===== T2 第 {n} 轮结束, 当前弹窗={end_kind} =====")
-    return end_kind
+    return True
 
 
 # ================= 第 14 步: 抽奖赢金币(天天抽奖老虎机) =================
@@ -1430,14 +1475,14 @@ def ensure_draw_page(max_attempt=6):
         log("[抽奖] 当前在广告页, 先退出广告(不再等倒计时)")
         if ad_stay_and_exit(tag="-恢复", dwell=False):
             return True
-    else:                                       # 黑底广告页/别的页面: 用系统 BACK 退
+    else:                                       # 黑底广告页/别的页面: 左滑优先(比BACK可靠)
         for _ in range(3):
             if draw_page_state() == "draw":
                 return True
             if on_coin_center():
                 break
-            log("[抽奖] 按 BACK 退出当前页")
-            back()
+            log("[抽奖] 左滑退出当前页")
+            swipe_left()
             if wait_draw_page(timeout=2.6):
                 return True
     for _ in range(2):                          # 抽奖页左上角返回 -> 金币中心
@@ -1930,9 +1975,9 @@ def lottery_free_once(tag="金币抽奖·免费"):
         return False
     time.sleep(1.0)
     if focus_is_ad_activity():
-        log(f"[{tag}] 进浏览广告 -> 停满5~6s 后系统BACK退出(角落✕是假关)")
+        log(f"[{tag}] 进浏览广告 -> 停满5~6s 后左滑退出(角落✕是假关, 左滑比BACK可靠)")
         time.sleep(random.uniform(*INCENTIVE_STAY_RANGE))
-        back()
+        swipe_left()
         time.sleep(2.5)
         if focus_is_ad_activity():
             rescue_from_stuck_ad()
@@ -2195,13 +2240,14 @@ if __name__ == "__main__":
                 run_draw_round(i)
             except Exception as e:
                 log(f"[抽奖-{i}] 异常: {type(e).__name__}: {e}")
-    elif step == "15":           # 右下角宝箱领金币
-        run_chest_once()
-    elif step == "16":           # 定时领金币(每5分钟)
-        run_timed_once()
-    elif step == "17":           # 两个 5 分钟任务各跑一次(轮询脚本用)
-        run_chest_once()
-        run_timed_once()
+    # 2026-11-03 用户指示: 宝箱/定时(15/16/17)先不跑, 保留代码但注释入口, 只跑四任务(12/13/14/18)
+    # elif step == "15":           # 右下角宝箱领金币
+    #     run_chest_once()
+    # elif step == "16":           # 定时领金币(每5分钟)
+    #     run_timed_once()
+    # elif step == "17":           # 两个 5 分钟任务各跑一次(轮询脚本用)
+    #     run_chest_once()
+    #     run_timed_once()
     elif step == "18":           # 金币抽奖(每日首次免费抽奖 + 看10次广告抽金币)
         n_rounds = int(sys.argv[2]) if len(sys.argv) > 2 else 1
         max_draw = int(sys.argv[3]) if len(sys.argv) > 3 else LOTTERY_MAX_DRAW
