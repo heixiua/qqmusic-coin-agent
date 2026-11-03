@@ -689,33 +689,39 @@ def detect_popup(shot="_fs_pop2.png"):
     return kind, btn
 
 
-def is_door_page(shot="_fs_door.png"):
-    """门页判定: 顶部有一条几乎纯黑的提示条(y≈170~260, 写着"点击后浏览15秒")。
-    金币中心是金色底、广告列表页是白底, 都不会有这条黑带。"""
-    screencap(shot)
-    with Image.open(shot) as im:
-        im = im.convert("RGB")
-        ow, oh = im.size
-        y = int(0.075 * oh)
-        xs = range(int(0.15 * ow), int(0.85 * ow), 40)
-        dark = 0
-        for x in xs:
-            r, g, b = im.getpixel((x, y))
-            if r + g + b < 200:
-                dark += 1
-        ratio = dark / max(1, len(list(xs)))
-    ok = ratio > 0.6
-    log(f"[门页判定] 顶部黑带占比 {ratio:.0%} -> {'是门页' if ok else '不是门页'}")
+def is_door_page(shot="_fs_door.png", use_existing=False):
+    """门页/广告页判定: 顶部有一条暗色提示条(写着"点击后浏览15秒"/"已观看广告15秒｜退出"等)。
+    黑条 y 位置不固定(实测 100~320 之间都会出现), 所以扫一整段找连续暗带;
+    并且要求"暗带下方不是暗的" —— 否则夜间模式的整页深色会被误判成广告页。"""
+    if not use_existing:
+        screencap(shot)
+    a = np.asarray(Image.open(shot).convert("RGB")).astype(np.int16)
+    oh, ow, _ = a.shape
+    xs = list(range(int(0.15 * ow), int(0.85 * ow), 40))
+    rows = []
+    for y in range(int(0.03 * oh), int(0.17 * oh), 8):
+        c = sum(1 for x in xs if int(a[y, x].sum()) < 200) / len(xs)
+        if c > 0.6:
+            rows.append(y)
+    if len(rows) < 3:
+        log(f"[门页判定] 顶部无暗带 -> 不是门页")
+        return False
+    y1 = rows[-1]
+    below = min(oh - 1, y1 + 80)
+    c_below = sum(1 for x in xs if int(a[below, x].sum()) < 200) / len(xs)
+    ok = c_below < 0.4
+    log(f"[门页判定] 暗带 y={rows[0]}~{y1}, 其下暗度 {c_below:.0%} -> {'是门页' if ok else '不是门页(整页深色)'}")
     return ok
 
 
-def is_plain_door(shot="_fs_doorplain.png"):
+def is_plain_door(shot="_fs_doorplain.png", use_existing=False):
     """门页是不是"纯白说明型"(整页白底 + 一行灰字, 例如"点击允许打开微信 / 查看内容，获取奖励")。
     这种门页没有 CTA 按钮, 停满 15s 平台就直接发奖励。
     判据用色彩饱和度(实测很干净):
         素材型门页(京东大图): 饱和像素 34%, 亮度 106
         纯白说明型:            饱和像素 0%,  亮度 253"""
-    screencap(shot)
+    if not use_existing:
+        screencap(shot)
     a = np.asarray(Image.open(shot).convert("RGB")).astype(np.int16)
     oh, ow, _ = a.shape
     reg = a[int(0.28 * oh):int(0.62 * oh), int(0.05 * ow):int(0.95 * ow), :]
@@ -1042,6 +1048,211 @@ def run_task2_round(n):
     return end_kind
 
 
+# ================= 第 14 步: 抽奖赢金币(天天抽奖老虎机) =================
+# 链路(用户确认):
+#   金币中心「抽奖赢金币→立即抽奖」-> 老虎机页
+#   点主按钮: 有次数就是「立即抽奖」, 没次数就是「看广告抽奖」
+#   广告: 纯白微信型, 黑条倒计时 15s -> 点「退出」-> 回老虎机(次数+1, 可能累积成2次)
+#   抽奖: 点「立即抽奖」-> 转 3s -> 结果窗 -> 点「开心收下」
+#   规则: 最多 10 次; 出现「明天再来」= 今日次数用完; 券类奖品也继续抽
+DRAW_TPL = "tpl_draw_row.png"       # 194x52 全分辨率灰度, 内容="抽奖赢金币"
+DRAW_TPL_X = 96                     # 模板在屏上的固定 x
+DRAW_BTN_DY = 24                    # 按钮中心相对模板顶部
+DRAW_MAIN_BTN = (540, 1563)         # 老虎机页主按钮(看广告抽奖/立即抽奖)
+DRAW_ACCEPT = (540, 1696)           # 结果窗「开心收下」
+DRAW_POPUP_X = (540, 1881)          # 结果窗底部圆形✕
+DRAW_MAX_SPINS = 10                 # 每日上限(页面写 10/10)
+
+
+def _match_text_row(tpl_path, tpl_x, shot, max_dist=10.0, y_lo=320, y_hi=1980,
+                    dy=0, btn_x=903, tag=""):
+    """通用的"按文字模板找列表行", 返回同行右侧按钮坐标。全分辨率灰度逐像素比对。"""
+    screencap(shot)
+    a = np.asarray(Image.open(shot).convert("L")).astype(np.int16)
+    tpl = np.asarray(Image.open(tpl_path).convert("L")).astype(np.int16)
+    oh, ow = a.shape
+    th, tw = tpl.shape
+    lo = max(0, y_lo - dy)
+    hi = min(oh - th - 10, y_hi - dy)
+    best_d, best_y = 999.0, -1
+    for y in range(lo, hi):
+        d = float(np.abs(a[y:y + th, tpl_x:tpl_x + tw] - tpl).mean())
+        if d < best_d:
+            best_d, best_y = d, y
+    log(f"[{tag}行匹配] 最小差异 {best_d:.1f} @ y={best_y}")
+    if best_y < 0 or best_d > max_dist:
+        return None
+    return int(btn_x / 1080 * ow), best_y + dy
+
+
+def draw_page_state(shot="_fs_draw.png", use_existing=False):
+    """老虎机页状态。判据(实测):
+        正常页   顶部天空 (46,133,255)  -> r<130 且 b>200 且 g>100 (必须卡 r, 否则白底广告页 255,255,255 会误判)
+        结果窗   整页被压暗 (18,53,102) -> 70<=b<=150 且 r<45
+        都不是   -> 广告页/别的页面"""
+    if not use_existing:
+        screencap(shot)
+    a = np.asarray(Image.open(shot).convert("RGB")).astype(np.int16)
+    r, g, b = (int(v) for v in a[180, 540])
+    if r < 130 and b > 200 and g > 100:
+        st = "draw"
+    elif 70 <= b <= 150 and r < 45:
+        st = "overlay"
+    else:
+        st = "other"
+    log(f"[抽奖页] 顶部色 ({r},{g},{b}) -> {st}")
+    return st
+
+
+def wait_draw_page(timeout=7.0, interval=0.9):
+    """轮询等"回到老虎机页"。为什么要等: 广告关闭的一瞬间会闪一帧纯黑(实测 top=(1,1,1)),
+    单次判定会把这一帧当成"没回到抽奖页", 于是继续乱点, 越点越远。"""
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        if draw_page_state() == "draw":
+            log(f"[抽奖页] {time.time() - t0:.1f}s 已回到抽奖页")
+            return True
+        time.sleep(interval)
+    log(f"[抽奖页] {timeout:.0f}s 内没回到抽奖页")
+    return False
+
+
+def ensure_draw_page(max_attempt=6):
+    """把页面弄到老虎机抽奖页: 已经是就返回; 否则先退到金币中心, 再滚到「抽奖赢金币」点进去。"""
+    if draw_page_state() == "draw":
+        return True
+    if draw_page_state() == "overlay":          # 压着结果窗, 先关掉
+        tap_human(*DRAW_ACCEPT)
+        time.sleep(1.6)
+        if draw_page_state() == "overlay":
+            tap_human(*DRAW_POPUP_X)
+            time.sleep(1.4)
+        if draw_page_state() == "draw":
+            return True
+    if is_door_page():                          # 明确的广告页(顶部有暗色提示条)
+        log("[抽奖] 当前在广告页, 先退出广告(不再等倒计时)")
+        if ad_stay_and_exit(tag="-恢复", dwell=False):
+            return True
+    else:                                       # 黑底广告页/别的页面: 用系统 BACK 退
+        for _ in range(3):
+            if draw_page_state() == "draw":
+                return True
+            if on_coin_center():
+                break
+            log("[抽奖] 按 BACK 退出当前页")
+            back()
+            if wait_draw_page(timeout=2.6):
+                return True
+    for _ in range(2):                          # 抽奖页左上角返回 -> 金币中心
+        tap_human(67, 155)
+        time.sleep(1.8)
+        if draw_page_state() == "draw":
+            return True
+        if on_coin_center():
+            break
+    if not on_coin_center() and not goto_coin_center():
+        log("[抽奖] 回不到金币中心")
+        return False
+    close_popup()
+    for _ in range(6):                          # 回顶部
+        before = "_fs_dtop.png"
+        screencap(before)
+        _adb("shell", "input", "swipe", "540", "700", "540", "1750", "400")
+        time.sleep(1.1)
+        screencap("_fs_dtop2.png")
+        if _dist(_fp(before), _fp("_fs_dtop2.png")) < 3.0:
+            break
+    for i in range(max_attempt):
+        btn = _match_text_row(DRAW_TPL, DRAW_TPL_X, "_fs_drow.png",
+                              dy=DRAW_BTN_DY, tag="抽奖")
+        if btn:
+            log(f"[抽奖] 找到「抽奖赢金币」行, 点 ({btn[0]},{btn[1]})")
+            tap_verified(btn[0], btn[1], wait=2.5)
+            time.sleep(1.0)
+            if draw_page_state() == "draw":
+                return True
+        log(f"[抽奖] 第{i + 1}次下滚找「抽奖赢金币」")
+        _adb("shell", "input", "swipe", "540", "1700", "540", "800", "450")
+        time.sleep(1.2)
+    return draw_page_state() == "draw"
+
+
+def ad_stay_and_exit(tag="", dwell=True):
+    """抽奖页里的广告: 等倒计时走完(15s) -> 找出口 -> 回老虎机页。返回是否回到抽奖页。
+    dwell=False 用于"已经在广告页里但不确定是否看完"的恢复场景, 不再白等 17s。"""
+    if dwell:
+        stay = random.uniform(*AD_STAY_RANGE)
+        log(f"[抽奖广告{tag}] 停留 {stay:.2f}s 等倒计时")
+        time.sleep(stay)
+    screencap("_fs_drawad.png")          # 必须先截图, screen_size 要读这个文件
+    ow, oh = screen_size("_fs_drawad.png")
+    # 按页面类型排出口顺序: 纯白说明型(微信)只有"退出", 素材型才有右上角✕
+    cands = list(DOOR_EXIT_CANDIDATES)
+    try:
+        if is_plain_door("_fs_drawad.png", use_existing=True):
+            cands = [(556, 93), (622, 89), (922, 110), (438, 93), (500, 659)]
+    except Exception:
+        pass
+    for i, (rx, ry) in enumerate(cands, 1):
+        tap_human(int(rx / 1000 * ow), int(ry / 1000 * oh))
+        time.sleep(1.4)
+        if wait_draw_page(timeout=3.5):
+            log(f"[抽奖广告{tag}] 出口#{i} 命中, 回到抽奖页")
+            return True
+    log(f"[抽奖广告{tag}] 固定出口都没反应 -> 视觉兜底")
+    tap_by_vision(target=EXIT_VISUAL_TARGET, tag=f"-DRAWEXIT{tag}")
+    ok = wait_draw_page(timeout=5.0)
+    log(f"[抽奖广告{tag}] 视觉兜底{'成功' if ok else '失败'}")
+    return ok
+
+
+def run_draw_round(n):
+    """跑一轮抽奖(最多 10 次)。返回实际抽奖次数。
+    不判断按钮上是"看广告抽奖"还是"立即抽奖" —— 直接点, 看 3.5s 后的结果分支:
+      出结果窗 = 抽到一次 / 进广告 = 这次只补次数 / 页面没变 = 次数用完(明天再来)。"""
+    log(f"===== 抽奖第 {n} 轮开始 =====")
+    ensure_in_app()
+    if not ensure_draw_page():
+        log(f"[抽奖{n}] 进不去抽奖页, 放弃本轮")
+        return None
+    spins, tries = 0, 0
+    while spins < DRAW_MAX_SPINS and tries < DRAW_MAX_SPINS * 2 + 6:
+        tries += 1
+        tap_human(*DRAW_MAIN_BTN)
+        time.sleep(3.5)
+        st = draw_page_state()
+        if st == "overlay":
+            spins += 1
+            log(f"[抽奖{n}] 第{spins}次抽奖 -> 出结果窗")
+            tap_human(*DRAW_ACCEPT)
+            time.sleep(1.8)
+            if draw_page_state() == "overlay":
+                log(f"[抽奖{n}] 「开心收下」没关掉, 点底部✕")
+                tap_human(*DRAW_POPUP_X)
+                time.sleep(1.5)
+            if draw_page_state() == "overlay":
+                log(f"[抽奖{n}] 结果窗还关不掉 -> 视觉兜底")
+                tap_by_vision(target="结果弹窗上的『开心收下』按钮或关闭✕", tag="-DRAWOK")
+                time.sleep(1.5)
+        elif st == "other":
+            if on_coin_center():
+                log(f"[抽奖{n}] 跑到金币中心了 -> 重新进抽奖页")
+                if not ensure_draw_page():
+                    break
+            else:
+                log(f"[抽奖{n}] 当前不是抽奖页(广告) -> 等倒计时并退出")
+                if not ad_stay_and_exit(tag=f"D{n}"):
+                    log(f"[抽奖{n}] 广告没退出成功, 尝试重新进抽奖页")
+                    if not ensure_draw_page():
+                        log(f"[抽奖{n}] 放弃本轮")
+                        break
+        else:
+            log(f"[抽奖{n}] 点主按钮没反应 -> 判定次数用完(明天再来)")
+            break
+    log(f"===== 抽奖第 {n} 轮结束, 实际抽奖 {spins} 次 =====")
+    return spins
+
+
 if __name__ == "__main__":
     import sys
 
@@ -1087,3 +1298,10 @@ if __name__ == "__main__":
                 run_task2_round(i)
             except Exception as e:
                 log(f"[T2-{i}] 异常: {type(e).__name__}: {e}")
+    elif step == "14":           # 抽奖赢金币(天天抽奖)循环
+        n_rounds = int(sys.argv[2]) if len(sys.argv) > 2 else 1
+        for i in range(1, n_rounds + 1):
+            try:
+                run_draw_round(i)
+            except Exception as e:
+                log(f"[抽奖-{i}] 异常: {type(e).__name__}: {e}")
