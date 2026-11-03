@@ -880,6 +880,8 @@ def _try_door_exit(ow, oh, tag, candidates, check=None):
 def _close_landing_x(ow, oh, tag, check=None):
     """点广告落地页左上 ✕(回到门页"恭喜已获得奖励")。
     不同平台的 ✕ 位置差 20~30px, 先点近的那个, 页面没反应再点另一个 —— 只在"没反应"时才点第二次。
+    ✕ 常是假关闭(实测 162,156 和 995,264 都点不动) -> 左滑兜底(激励链验证过左滑=系统返回有效),
+    左滑变了但没到目标页 -> 系统 BACK 兜底。
     check: 目标判定, 默认金币中心。"""
     check = check or on_coin_center
     log(f"[广告{tag}] 点广告页左上'✕'")
@@ -897,7 +899,24 @@ def _close_landing_x(ow, oh, tag, check=None):
             return True
         screencap("_fs_adx_post2.png")
         if _dist(_fp("_fs_adx_pre.png"), _fp("_fs_adx_post2.png")) < 6.0:
-            log(f"[广告{tag}] 两个 ✕ 都没反应 -> 走视觉兜底找关闭入口")
+            log(f"[广告{tag}] 两个 ✕ 都没反应 -> 左滑兜底(X不掉就左滑)")
+            _adb("shell", "input", "swipe", str(int(ow * 0.99)), str(int(oh * 0.5)),
+                 str(int(ow * 0.15)), str(int(oh * 0.5)), "250")
+            time.sleep(1.8)
+            if check():
+                log(f"[广告{tag}] 左滑后回到目标页")
+                return True
+            screencap("_fs_adx_post3.png")
+            if _dist(_fp("_fs_adx_pre.png"), _fp("_fs_adx_post3.png")) >= 6.0:
+                log(f"[广告{tag}] 左滑让页面变了但没到目标页 -> 等渲染")
+                if wait_coin_center(timeout=4.0, check=check):
+                    return True
+            log(f"[广告{tag}] 左滑后仍不在目标页 -> 系统 BACK 兜底")
+            back()
+            time.sleep(1.8)
+            if wait_coin_center(timeout=5.0, check=check):
+                return True
+            log(f"[广告{tag}] BACK 后仍不在目标页 -> 走视觉兜底找关闭入口")
             tap_by_vision(target=EXIT_VISUAL_TARGET, tag=f"-EXIT{tag}")
             time.sleep(1.2)
             if check():
