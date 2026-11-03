@@ -1121,7 +1121,15 @@ def run_round(n):
             log(f"[第{n}轮] 入口点不动, 试点'放弃奖励'解围")
             tap_human(int(AD_GIVEUP_REL[0] / 1000 * ow), int(AD_GIVEUP_REL[1] / 1000 * oh))
             time.sleep(1.8)
-            tap_verified(ex, ey, wait=2.0)
+            if not tap_verified(ex, ey, wait=2.0):
+                # 解围后仍点不动 + 没有弹窗 = 「看视频」入口消失了 = 红包刷完
+                # (交接文档§4: 任务完成靠结束信号"入口消失", 不是"跑满N轮")
+                k2, _ = detect_popup()
+                if not k2:
+                    log(f"[第{n}轮] 「看视频」入口消失且无弹窗 -> 红包已刷完(结束信号)")
+                    return TASK_DONE
+                log(f"[第{n}轮] 入口点不动但仍有弹窗 -> 本轮放弃")
+                return None
 
     ok = run_ad_once(tag=f"R{n}")
     end_kind = run_incentive_chain(max_n=6, tag=f"R{n}") if ok else None
@@ -1177,8 +1185,9 @@ def run_task2_round(n):
 
     btn = ensure_task2_row()
     if not btn:
-        log(f"[T2-{n}] 找不到'看视频得高额金币'这一行, 放弃本轮")
-        return None
+        # 任务行消失 = 该任务今日已刷完(结束信号), 不是"无进展"——交接文档§4铁律
+        log(f"[T2-{n}] '看视频得高额金币'这一行消失 -> 任务已刷完(结束信号)")
+        return TASK_DONE
 
     screencap("_fs_t2_entry.png")
     ow, oh = screen_size("_fs_t2_entry.png")
@@ -1898,10 +1907,13 @@ def run_lottery_round(n, max_draw=LOTTERY_MAX_DRAW):
 # 设计依据(用户确认过的串联规则 + 交接文档纪律):
 #   - 调度顺序: 看视频领金币(12) -> 看视频得高额金币(13) -> 抽奖赢金币(14) -> 金币抽奖(18)
 #   - 任务间必须清弹窗、确保回金币中心, 再进下一个任务(否则弹窗吃掉手势)
-#   - 连续 2 轮无进展 = 该任务次数用完, 早停, 不硬跑
+#   - 任务"完成"必须靠结束信号(交接文档§4铁律): 入口消失 / 次数0 / 「明天再来」,
+#     绝不能靠"跑满N轮"当完成(红包还有6个200就停了)
 #   - 宝箱/定时(15/16) 不并入本调度: D9 铁律, 它们会弹窗打断广告流程, 保持 step17 单独轮询
 #   - 汇总只打印控制台, 不写文件(用户偏好: 日志仅控制台)
 # 用法: python flow_step.py 20 [任务1轮数] [任务2轮数]   (默认 5 3)
+# 任务完成信号: 任务函数返回 TASK_DONE = 该任务已天然刷完(入口消失/次数0/明天再来)
+TASK_DONE = "done"
 
 
 def _rec(results, task, status, count, reason):
@@ -1921,7 +1933,11 @@ def _drain_popup_sched(tag):
 
 
 def _run_one_task(results, task, n_rounds, run_func, name):
-    """跑一个任务 n 轮, 连续 2 轮无进展即早停。返回完成轮数。"""
+    """跑一个任务 n 轮。任务完成靠结束信号(交接文档§4铁律):
+      - run_func 返回 TASK_DONE = 入口消失/次数0/明天再来 -> 立即判完成, 不硬跑
+      - 返回 None 连续 2 轮 = 疑似卡住(非完成), 保险丝早停
+      - 其余返回值 = 本轮有进展
+    返回完成轮数。"""
     fail, done = 0, 0
     for i in range(1, n_rounds + 1):
         try:
@@ -1929,11 +1945,14 @@ def _run_one_task(results, task, n_rounds, run_func, name):
         except Exception as e:
             log(f"[{name}-{i}] 异常 {type(e).__name__}: {e}")
             r = None
+        if r == TASK_DONE:
+            _rec(results, task, "DONE(结束信号)", done, f"入口消失/次数0/明天再来, 第{i}轮确认")
+            return done
         if r is None:
             fail += 1
             log(f"[调度] {name} 第{i}轮无进展 {fail}/2")
             if fail >= 2:
-                _rec(results, task, "DONE(连续2轮无进展)", done, f"第{i}轮起早停")
+                _rec(results, task, "STOPPED(疑似卡住)", done, f"连续{fail}轮无进展, 保险丝早停")
                 return done
         else:
             done += 1
