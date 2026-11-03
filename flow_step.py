@@ -591,6 +591,18 @@ def focus_is_ad_activity():
     return bool(AD_ACTIVITY_PAT.search(out or ""))
 
 
+def _current_focus_name():
+    """返回当前前台 Activity 的短类名(最后一段), 判断用。取不到返回空串。
+    原始格式: mCurrentFocus=Window{cc0d00 u0 包名/包名.activity.AppStarterActivity type=1}
+    必须取 "/" 后面那段才是 Activity —— 只截 [\\w.]+ 会停在 "/" 上, 拿到的是包名"qqmusic"。"""
+    out = _adb("shell", "dumpsys window | grep mCurrentFocus") or ""
+    m = re.search(r"u0 ([\w./]+)", out)
+    if not m:
+        return ""
+    cls = m.group(1).split("/")[-1]
+    return cls.split(".")[-1]
+
+
 def _screen_dark(shot="_fs_dark.png"):
     """整页是否近乎全黑(均值<60)。用途有二:
     1) 跳转/关广告瞬间会闪一帧纯黑过渡(实测 (1,1,1)), 此时任何判定都不可信;
@@ -1481,6 +1493,280 @@ def run_timed_once(tag="定时领金币", max_scroll=10):
     return "notfound"
 
 
+# ================= 第 18 步: 金币抽奖(每日首次免费抽奖 + 看10次广告抽金币) =================
+# 本模块是金币中心底部一个独立小组件, 和任务14「抽奖赢金币」(老虎机页)不是一回事:
+#   状态A(今天还没抽过免费): 模块中间是橙色「每日首次免费抽奖」卡片
+#       -> 点 -> 抽奖中 -> 弹「恭喜获得75金币」窗 -> 橙钮「浏览5秒再领125金币」
+#       -> PortraitADActivity 浏览广告(角落✕是假关, 必须用系统 BACK 退) -> 九宫格出现
+#   状态B(已激活): 3x3 九宫格, 中间橙格「看广告抽奖」
+#       -> 点 -> TMECoreActivity 视频广告(12~15s) -> 顶部黑条「退出」(556,93)->(600,223)
+#       -> 回九宫格抽奖中 -> 弹「恭喜获得+150金币」 -> 底部圆形✕(500,788)关
+# 模板: tpl_lottery_free.png(每日首次免费抽奖卡片) / tpl_lottery_draw.png(看广告抽奖格)
+# 两个橙块宽度相同(x 都固定在≈538), 只是文字不同, 用灰度模板区分。
+LOTTERY_FREE_TPL = "tpl_lottery_free.png"
+LOTTERY_DRAW_TPL = "tpl_lottery_draw.png"
+LOTTERY_BROWSE_CTA_REL = (500, 896)   # 浏览型广告: 底部「点击浏览15秒」蓝字 (实测 540,2150)
+LOTTERY_TPL_X = 385                 # 模板在屏上的固定 x 起点(橙块恒在 x≈402-675)
+LOTTERY_MAX_DRAW = 10               # 每日上限(页面写 10 次)
+
+
+def _match_lottery_block(tpl_path, shot="_fs_lotblock.png", max_dist=15.0, y_lo=120, y_hi=2280, tag=""):
+    """金币抽奖专用: 在固定 x 列做全分辨率灰度模板匹配, 返回橙块中心 (cx,cy) 或 None。
+    为什么固定 x: 金币中心里这个橙块横向永远居中(x≈402-675), 只有纵向随滚动变, 所以只扫 y。"""
+    screencap(shot)
+    a = np.asarray(Image.open(shot).convert("L")).astype(np.int16)
+    tpl = np.asarray(Image.open(tpl_path).convert("L")).astype(np.int16)
+    oh, ow = a.shape
+    th, tw = tpl.shape
+    x0 = LOTTERY_TPL_X
+    lo, hi = max(0, y_lo), min(oh - th - 5, y_hi)
+    best_d, best_y = 999.0, -1
+    for y in range(lo, hi):
+        d = float(np.abs(a[y:y + th, x0:x0 + tw] - tpl).mean())
+        if d < best_d:
+            best_d, best_y = d, y
+    log(f"[金币抽奖·{tag}] 模板最小差异 {best_d:.1f} @ y={best_y}")
+    if best_y < 0 or best_d > max_dist:
+        return None
+    return int(x0 + tw / 2), best_y + th // 2
+
+
+def _lottery_state():
+    """扫一次屏同时匹配两个模板(免费卡 / 看广告抽奖格), 取差异更小的那个。
+    返回 ('free','draw',None 之一, 中心坐标)。两个橙块长得很像(跨匹配差异≈7),
+    但真匹配差异≈0, 用 <5 阈值 + 取更小差异来区分, 避免「看广告抽奖格」被误认成免费卡。"""
+    screencap("_fs_lot_state.png")
+    a = np.asarray(Image.open("_fs_lot_state.png").convert("L")).astype(np.int16)
+    oh, ow = a.shape
+    tf = np.asarray(Image.open(LOTTERY_FREE_TPL).convert("L")).astype(np.int16)
+    td = np.asarray(Image.open(LOTTERY_DRAW_TPL).convert("L")).astype(np.int16)
+
+    def scan(tpl):
+        th, tw = tpl.shape
+        lo, hi = 120, oh - th - 5
+        bd, by = 999.0, -1
+        for y in range(lo, hi):
+            d = float(np.abs(a[y:y + th, LOTTERY_TPL_X:LOTTERY_TPL_X + tw] - tpl).mean())
+            if d < bd:
+                bd, by = d, y
+        return bd, by, th, tw
+
+    df, yf, thf, twf = scan(tf)
+    dd, yd, thd, twd = scan(td)
+    log(f"[金币抽奖·状态] free差异{df:.1f} draw差异{dd:.1f}")
+    cf = (int(LOTTERY_TPL_X + twf / 2), yf + thf // 2)
+    cd = (int(LOTTERY_TPL_X + twd / 2), yd + thd // 2)
+    if df < 5.0 and df <= dd:
+        return "free", cf
+    if dd < 5.0:
+        return "draw", cd
+    return None, None
+
+
+def find_lottery_free(shot="_fs_lotfree.png", tag="每日首次免费抽奖"):
+    return _match_lottery_block(LOTTERY_FREE_TPL, shot, tag=tag)
+
+
+def find_lottery_draw(shot="_fs_lotcell.png", tag="看广告抽奖"):
+    return _match_lottery_block(LOTTERY_DRAW_TPL, shot, tag=tag)
+
+
+def _wait_popup(timeout=8.0, interval=1.0):
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        if detect_popup()[1]:
+            return True
+        time.sleep(interval)
+    return False
+
+
+def ensure_lottery_module(max_scroll=14):
+    """确保在金币中心且金币抽奖模块已滚入视野(免费卡或九宫格任一可见)。"""
+    ensure_in_app()
+    if not on_coin_center() and not goto_coin_center():
+        log("[金币抽奖] 回不到金币中心")
+        return False
+    close_popup()
+    st, _ = _lottery_state()
+    if st in ("free", "draw"):
+        return True
+    # 回顶部
+    for _ in range(6):
+        before = "_fs_lt_top.png"
+        screencap(before)
+        _adb("shell", "input", "swipe", "540", "700", "540", "1750", "400")
+        time.sleep(1.1)
+        screencap("_fs_lt_top2.png")
+        if _dist(_fp(before), _fp("_fs_lt_top2.png")) < 3.0:
+            break
+    # 从顶部往下找
+    for _ in range(max_scroll):
+        if find_lottery_free() or find_lottery_draw():
+            return True
+        _adb("shell", "input", "swipe", "540", "1500", "540", "900", "450")
+        time.sleep(1.2)
+    return bool(find_lottery_free() or find_lottery_draw())
+
+
+def lottery_browse_ad_flow(ow, oh, tag=""):
+    """浏览型广告流程(2026-11-03 两轮实测验证, 广告主京东/1688 结构一致):
+    TMECore广告页 停2~5s -> 点底部「点击浏览15秒」(rel 500,896)
+    -> 跳落地页(ADActivity) 停16~18s(规则要求15s+) -> 点左上✕(AD_WEBVIEW_X_REL, rel 150,65)
+    -> 回外层TMECore(顶部显示「恭喜获得奖励」=奖励已发) -> 点右上✕(rel 922,110) -> 回金币中心。
+    返回 True=流程走完 / False=不是浏览型(调用方走视频型兜底 lottery_ad_exit)。
+    注意: 落地页里「点击商品再得额外奖励」是二次引流, 绝不点, 只等计时。"""
+    stay = random.uniform(2.0, 5.0)
+    log(f"[金币抽奖广告{tag}] 浏览型: 广告页停留 {stay:.1f}s")
+    time.sleep(stay)
+    bx = int(LOTTERY_BROWSE_CTA_REL[0] / 1000 * ow)
+    by = int(LOTTERY_BROWSE_CTA_REL[1] / 1000 * oh)
+    log(f"[金币抽奖广告{tag}] 点「点击浏览15秒」({bx},{by})")
+    tap_human(bx, by)
+    time.sleep(2.5)
+    if not focus_is_ad_activity():
+        return True                      # 点完直接回金币中心(少数情况)
+    cur = _current_focus_name()
+    if cur != "ADActivity":              # 没跳落地页 -> 不是浏览型
+        log(f"[金币抽奖广告{tag}] 未跳落地页(前台={cur or '?'}) -> 交视频型兜底")
+        return False
+    stay2 = random.uniform(16.0, 18.0)
+    log(f"[金币抽奖广告{tag}] 落地页停留 {stay2:.1f}s (要求15s+)")
+    time.sleep(stay2)
+    xx = int(AD_WEBVIEW_X_REL[0] / 1000 * ow)
+    xy = int(AD_WEBVIEW_X_REL[1] / 1000 * oh)
+    log(f"[金币抽奖广告{tag}] 点落地页左上✕ ({xx},{xy})")
+    tap_human(xx, xy)
+    time.sleep(2.0)
+    if focus_is_ad_activity():           # 外层 TMECore, 右上✕
+        log(f"[金币抽奖广告{tag}] 点外层右上✕ (rel 922,110)")
+        tap_human(int(922 / 1000 * ow), int(110 / 1000 * oh))
+        time.sleep(2.0)
+    return not focus_is_ad_activity()
+
+
+def lottery_ad_exit(ow, oh, tag=""):
+    """视频型广告兜底(倒计时走完后点顶部「退出」): 当浏览型流程没跳落地页时才走这里。
+    关键教训: 绝不能用底部「关闭广告/放弃奖励」(500,659) 那个出口——它会放弃奖励,
+    导致广告白看、抽奖不计数、也不弹结果窗。若一次没退出来(广告更长), 再等一轮重试。"""
+    top_exits = [(556, 93), (622, 89), (922, 110)]
+    for attempt in range(3):
+        stay = random.uniform(22.0, 28.0)
+        log(f"[金币抽奖广告{tag}] 第{attempt + 1}次停留 {stay:.1f}s 等倒计时")
+        time.sleep(stay)
+        if not focus_is_ad_activity():
+            return True
+        for (rx, ry) in top_exits:
+            tap_human(int(rx / 1000 * ow), int(ry / 1000 * oh))
+            time.sleep(2.0)
+            if not focus_is_ad_activity():
+                log(f"[金币抽奖广告{tag}] 顶部退出命中(第{attempt + 1}轮)")
+                return True
+    tap_by_vision(target=EXIT_VISUAL_TARGET, tag=f"-LOTEXIT{tag}")
+    return not focus_is_ad_activity()
+
+
+def lottery_close_result(tag=""):
+    """关掉抽奖结果弹窗: 先点底部圆形✕(相对500,788), 不行再视觉兜底。"""
+    screencap("_fs_lot_rsize.png")
+    ow, oh = screen_size("_fs_lot_rsize.png")
+    tap_human(int(500 / 1000 * ow), int(788 / 1000 * oh))
+    time.sleep(1.5)
+    if not detect_popup()[1]:
+        return True
+    tap_by_vision(target="中奖弹窗的关闭✕或『开心收下』按钮", tag=f"-LOTOK{tag}")
+    time.sleep(1.5)
+    return not detect_popup()[1]
+
+
+def lottery_free_once(tag="金币抽奖·免费"):
+    """状态A: 每日首次免费抽奖 -> 抽奖中 -> 75币弹窗 -> 浏览5秒再领125 -> 浏览广告(BACK退) -> 九宫格。
+    今天若已做过(已是九宫格)返回 False。用 _lottery_state 区分免费卡/看广告抽奖格, 避免误判。"""
+    state, card = _lottery_state()
+    if state != "free" or not card:
+        log(f"[{tag}] 当前不是免费抽奖卡片状态(已激活九宫格/已做过) -> 跳过")
+        return False
+    log(f"[{tag}] 点每日首次免费抽奖 ({card[0]},{card[1]})")
+    tap_human(*card)
+    time.sleep(2.5)
+    if not _wait_popup(timeout=9):
+        log(f"[{tag}] 没等到抽奖结果弹窗")
+        return False
+    btn = detect_popup()[1]
+    if not btn:
+        return False
+    log(f"[{tag}] 点橙色「浏览5秒再领金币」({btn[0]},{btn[1]})")
+    if not tap_verified(*btn, wait=2.2):
+        return False
+    time.sleep(1.0)
+    if focus_is_ad_activity():
+        log(f"[{tag}] 进浏览广告 -> 停满5~6s 后系统BACK退出(角落✕是假关)")
+        time.sleep(random.uniform(*INCENTIVE_STAY_RANGE))
+        back()
+        time.sleep(2.5)
+        if focus_is_ad_activity():
+            rescue_from_stuck_ad()
+    return True
+
+
+def lottery_draw_once(tag=""):
+    """点一次「看广告抽奖」并收尾。返回 True=抽到结果 / False=没抽到(可能次数用完)。"""
+    cell = find_lottery_draw()
+    if not cell:
+        log(f"[金币抽奖·{tag}] 找不到看广告抽奖格 -> 跳过本次")
+        return False
+    log(f"[金币抽奖·{tag}] 点看广告抽奖 ({cell[0]},{cell[1]})")
+    tap_human(*cell)
+    time.sleep(2.0)
+    screencap("_fs_lot_dsize.png")
+    ow, oh = screen_size("_fs_lot_dsize.png")
+    # 等广告出现(偶尔直接出结果)
+    ad = False
+    for _ in range(10):
+        if focus_is_ad_activity():
+            ad = True
+            break
+        if detect_popup()[1]:
+            lottery_close_result(tag)
+            return True
+        time.sleep(1.0)
+    if ad:
+        # 先走浏览型(实测主形态: 点「点击浏览15秒」-> 落地页 -> 两层✕), 失败再走视频型兜底
+        if not lottery_browse_ad_flow(ow, oh, tag=tag):
+            if not lottery_ad_exit(ow, oh, tag=tag):
+                log(f"[金币抽奖·{tag}] 广告没退出 -> 抢救")
+                if not rescue_from_stuck_ad():
+                    return False
+        time.sleep(2.5)
+    # 等结果弹窗
+    for _ in range(10):
+        if detect_popup()[1]:
+            lottery_close_result(tag)
+            return True
+        time.sleep(1.5)
+    log(f"[金币抽奖·{tag}] 等不到结果弹窗 -> 判定次数用完/结束")
+    return False
+
+
+def run_lottery_round(n, max_draw=LOTTERY_MAX_DRAW):
+    log(f"===== 金币抽奖 第 {n} 轮开始 =====")
+    ensure_in_app()
+    if not ensure_lottery_module():
+        log("[金币抽奖] 找不到模块, 放弃本轮")
+        return
+    lottery_free_once()                 # 状态A(今天若没做过)
+    done = 0
+    for i in range(max_draw):
+        if not find_lottery_draw():
+            log(f"[金币抽奖] 看广告抽奖格不见了(次数用完/页面变化) -> 结束")
+            break
+        if not lottery_draw_once(tag=f"第{i + 1}抽"):
+            log(f"[金币抽奖] 第{i + 1}次没抽到 -> 结束")
+            break
+        done += 1
+    log(f"===== 金币抽奖 第 {n} 轮结束, 实际抽了 {done} 次 =====")
+    return done
+
+
 if __name__ == "__main__":
     import sys
 
@@ -1540,3 +1826,11 @@ if __name__ == "__main__":
     elif step == "17":           # 两个 5 分钟任务各跑一次(轮询脚本用)
         run_chest_once()
         run_timed_once()
+    elif step == "18":           # 金币抽奖(每日首次免费抽奖 + 看10次广告抽金币)
+        n_rounds = int(sys.argv[2]) if len(sys.argv) > 2 else 1
+        max_draw = int(sys.argv[3]) if len(sys.argv) > 3 else LOTTERY_MAX_DRAW
+        for i in range(1, n_rounds + 1):
+            try:
+                run_lottery_round(i, max_draw=max_draw)
+            except Exception as e:
+                log(f"[金币抽奖-{i}] 异常: {type(e).__name__}: {e}")
