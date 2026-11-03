@@ -828,68 +828,35 @@ def tap_door_cta(ow, oh, tag=""):
     return False
 
 
-def run_ad_once(tag="", entry_shot="_fs_entry.png"):
-    """从"已点入口"开始, 走完一次广告并退回金币中心。返回是否成功回到金币中心。
-    entry_shot 是"点击入口之前"那一帧, 用来判断点击后页面有没有跳转。"""
-    changed, used, d, _ = wait_change(entry_shot, timeout=4.0)
-    log(f"[广告{tag}] 入口点击后 {used:.1f}s 页面{'已跳转' if changed else '没变化'}")
+# ================= 广告形态分发器(2026-11-03 重构, 一次只改一件事) =================
+# 设计: 识别当前广告属于哪种形态 -> 按 AD_HANDLERS 分派到独立 handler。
+#   每个 handler 自包含该形态的解法、停留参数与出口策略; 新增广告形态 = 新增一个 handler,
+#   不用再在 run_round / run_task2_round 里各改一遍。
+# 形态清单(对应交接文档 §4 广告8形态速查中由 run_ad_once 覆盖的部分):
+#   AD_FORM_PLAIN_DOOR    纯白说明型门页: 无 CTA, 停满 15s 平台直接发奖励
+#   AD_FORM_MATERIAL_DOOR 素材型门页: 点 CTA 跳落地页, 浏览满 15s, 落地页✕ 再门页出口
+#   AD_FORM_LANDING_PAGE  落地页ADActivity(非门页): 直接计时 -> 落地页✕ -> 门页出口
+# 其余形态(插屏/黑屏过渡帧/误入站内页/卡死Activity)仍由原检测链处理, 不在本次改动范围。
+# 2026-11-03 实测: 纯白说明型门页两轮均出口#2(黑条"退出" 599,222)命中, 出口#1(右上角✕)无效
+#   -> 纯白型出口候选把黑条退出提到最前, 省掉每次白试 ✕ 的 ~1.8s。
 
-    landed = True                # 有没有真的进到广告落地页(纯白说明型门页永远不跳转)
-    if is_door_page():
-        stay = random.uniform(*DOOR_STAY_RANGE)
-        log(f"[广告{tag}] 门页停留 {stay:.2f}s")
-        time.sleep(stay)
-        ow, oh = screen_size("_fs_door.png")
-        if is_plain_door():
-            # 纯白说明型(页面只有一行"点击允许打开微信/查看内容"): 没有 CTA 可点,
-            # 停满 15s 平台就发奖励。以前这里会硬点 CTA + 问模型, 白烧 30s。
-            log(f"[广告{tag}] 纯白说明型门页 -> 不点 CTA, 直接计时")
-            landed = False
-        else:
-            landed = tap_door_cta(ow, oh, tag)
-        t_land = time.time()
-    else:
-        log(f"[广告{tag}] 不是门页, 视为已在广告/落地页")
-        t_land = time.time()
-        ow, oh = screen_size("_fs_entry.png")
+AD_FORM_PLAIN_DOOR = "纯白说明型门页"
+AD_FORM_MATERIAL_DOOR = "素材型门页"
+AD_FORM_LANDING_PAGE = "落地页ADActivity"
+AD_FORM_UNKNOWN = "未知形态"
 
-    stay = random.uniform(*AD_STAY_RANGE)
-    remain = t_land + stay - time.time()
-    if remain > 0:
-        log(f"[广告{tag}] 广告页停留 {stay:.2f}s")
-        time.sleep(remain)
+# 出口候选排序差异:
+#   素材型/落地页: 右上角✕(922,110) -> 黑条退出(556,93)/(622,89) -> 插屏跳过(438,93) -> 关闭广告(500,659)
+#   纯白说明型:   黑条退出优先(实测 599,222 命中), 右上角✕对纯白型无效
+DOOR_EXIT_PLAIN = [(556, 93), (622, 89), (438, 93), (500, 659)]
 
-    if not landed:
-        log(f"[广告{tag}] 一直停在门页, 跳过落地页✕, 直接找门页出口")
-    else:
-        # ① 点广告落地页左上 ✕ (回到门页"恭喜已获得奖励")
-        #    不同广告平台的落地页 ✕ 位置差 20~30px(京东热卖实测 162,155; 老列表页 139,140),
-        #    所以先点近的那个, 页面没反应再点另一个 —— 只在"没反应"时才点第二次, 不会误退两层。
-        log(f"[广告{tag}] 点广告页左上'✕'")
-        screencap("_fs_adx_pre.png")
-        tap_human(int(AD_WEBVIEW_X_REL[0] / 1000 * ow), int(AD_WEBVIEW_X_REL[1] / 1000 * oh))
-        time.sleep(1.8)
-        if on_coin_center():
-            return True
-        screencap("_fs_adx_post.png")
-        if _dist(_fp("_fs_adx_pre.png"), _fp("_fs_adx_post.png")) < 6.0:
-            log(f"[广告{tag}] ✕ 没反应, 换第二个候选点")
-            tap_human(int(AD_WEBVIEW_X2_REL[0] / 1000 * ow), int(AD_WEBVIEW_X2_REL[1] / 1000 * oh))
-            time.sleep(1.8)
-            if on_coin_center():
-                return True
-            screencap("_fs_adx_post2.png")
-            if _dist(_fp("_fs_adx_pre.png"), _fp("_fs_adx_post2.png")) < 6.0:
-                log(f"[广告{tag}] 两个 ✕ 都没反应 -> 走视觉兜底找关闭入口")
-                tap_by_vision(target=EXIT_VISUAL_TARGET, tag=f"-EXIT{tag}")
-                time.sleep(1.2)
-                if on_coin_center():
-                    return True
-    # ② 找门页的关闭入口: 右上角✕(素材型) 或 顶部黑条右侧"退出"(纯白说明型, 实测 600,222)
-    log(f"[广告{tag}] 找门页关闭入口")
+
+def _try_door_exit(ow, oh, tag, candidates):
+    """按给定候选顺序试门页出口; 每个候选点完判是否回金币中心, 页面变化了但没回就等渲染。
+    全部没反应 -> 视觉兜底找退出入口。返回是否回到金币中心。"""
     before = "_fs_dx_pre.png"
     screencap(before)
-    for i, (rx, ry) in enumerate(DOOR_EXIT_CANDIDATES, 1):
+    for i, (rx, ry) in enumerate(candidates, 1):
         tap_human(int(rx / 1000 * ow), int(ry / 1000 * oh))
         time.sleep(1.8)
         if on_coin_center():
@@ -901,12 +868,47 @@ def run_ad_once(tag="", entry_shot="_fs_entry.png"):
             if wait_coin_center(timeout=4.0):
                 return True
             break
-    else:
-        log(f"[广告{tag}] 门页出口候选都没反应 -> 走视觉兜底")
-        tap_by_vision(target=EXIT_VISUAL_TARGET, tag=f"-DOOREXIT{tag}")
-        if wait_coin_center(timeout=6.0):
+    log(f"[广告{tag}] 门页出口候选都没反应 -> 走视觉兜底")
+    tap_by_vision(target=EXIT_VISUAL_TARGET, tag=f"-DOOREXIT{tag}")
+    return wait_coin_center(timeout=6.0)
+
+
+def _close_landing_x(ow, oh, tag):
+    """点广告落地页左上 ✕(回到门页"恭喜已获得奖励")。
+    不同平台的 ✕ 位置差 20~30px, 先点近的那个, 页面没反应再点另一个 —— 只在"没反应"时才点第二次。"""
+    log(f"[广告{tag}] 点广告页左上'✕'")
+    screencap("_fs_adx_pre.png")
+    tap_human(int(AD_WEBVIEW_X_REL[0] / 1000 * ow), int(AD_WEBVIEW_X_REL[1] / 1000 * oh))
+    time.sleep(1.8)
+    if on_coin_center():
+        return True
+    screencap("_fs_adx_post.png")
+    if _dist(_fp("_fs_adx_pre.png"), _fp("_fs_adx_post.png")) < 6.0:
+        log(f"[广告{tag}] ✕ 没反应, 换第二个候选点")
+        tap_human(int(AD_WEBVIEW_X2_REL[0] / 1000 * ow), int(AD_WEBVIEW_X2_REL[1] / 1000 * oh))
+        time.sleep(1.8)
+        if on_coin_center():
             return True
-    # ③ 没回去 → 多半弹了"现在退出就没有奖励哦"挽留窗(没有橙色按钮, 扫描会失明)
+        screencap("_fs_adx_post2.png")
+        if _dist(_fp("_fs_adx_pre.png"), _fp("_fs_adx_post2.png")) < 6.0:
+            log(f"[广告{tag}] 两个 ✕ 都没反应 -> 走视觉兜底找关闭入口")
+            tap_by_vision(target=EXIT_VISUAL_TARGET, tag=f"-EXIT{tag}")
+            time.sleep(1.2)
+            if on_coin_center():
+                return True
+    return False
+
+
+def _ad_stay(tag):
+    """广告/落地页停留(平台规则 15s 硬下限, 不能缩)。"""
+    stay = random.uniform(*AD_STAY_RANGE)
+    log(f"[广告{tag}] 广告页停留 {stay:.2f}s")
+    time.sleep(stay)
+
+
+def _rescue_giveup(ow, oh, tag):
+    """兜底: 出口候选都没回去 -> 多半弹了"现在退出就没有奖励哦"挽留窗
+    (没有橙色按钮, 扫描会失明), 点"放弃奖励"解围。"""
     for attempt in (1, 2):
         log(f"[广告{tag}] 未回金币中心, 判定为挽留窗 -> 点'放弃奖励' (第{attempt}次)")
         tap_human(int(AD_GIVEUP_REL[0] / 1000 * ow), int(AD_GIVEUP_REL[1] / 1000 * oh))
@@ -916,6 +918,89 @@ def run_ad_once(tag="", entry_shot="_fs_entry.png"):
             return True
     log(f"[广告{tag}] 警告: 仍未能回到金币中心")
     return False
+
+
+def _handle_plain_door(ow, oh, tag):
+    """纯白说明型门页: 没有 CTA 可点, 停满 15s 平台就发奖励。
+    出口优先黑条"退出"(实测 599,222), 跳过素材型右上角✕(纯白型没有, 每次白等 1.8s)。"""
+    log(f"[广告{tag}] 纯白说明型门页 -> 不点 CTA, 直接计时")
+    _ad_stay(tag)
+    log(f"[广告{tag}] 一直停在门页, 跳过落地页✕, 直接找门页出口")
+    return _try_door_exit(ow, oh, tag, DOOR_EXIT_PLAIN)
+
+
+def _handle_material_door(ow, oh, tag):
+    """素材型门页: 点 CTA 跳落地页 -> 浏览满 15s -> 落地页✕ -> 门页出口。
+    CTA 点不动时退化为"纯白型"处理(停满直接找出口, 不硬点)。"""
+    landed = tap_door_cta(ow, oh, tag)
+    _ad_stay(tag)
+    if not landed:
+        log(f"[广告{tag}] CTA 没点动, 视为停在门页, 直接找门页出口")
+        if _try_door_exit(ow, oh, tag, DOOR_EXIT_CANDIDATES):
+            return True
+        return _rescue_giveup(ow, oh, tag)
+    if _close_landing_x(ow, oh, tag):
+        return True
+    if _try_door_exit(ow, oh, tag, DOOR_EXIT_CANDIDATES):
+        return True
+    return _rescue_giveup(ow, oh, tag)
+
+
+def _handle_landing_page(ow, oh, tag):
+    """落地页ADActivity(入口点击后直接进广告落地页, 没有门页): 计时 -> 落地页✕ -> 门页出口。"""
+    log(f"[广告{tag}] 不是门页, 视为已在广告/落地页")
+    _ad_stay(tag)
+    if _close_landing_x(ow, oh, tag):
+        return True
+    if _try_door_exit(ow, oh, tag, DOOR_EXIT_CANDIDATES):
+        return True
+    return _rescue_giveup(ow, oh, tag)
+
+
+def _handle_unknown_ad(ow, oh, tag):
+    """未知形态兜底: 计时 -> 视觉找退出; 再不行按挽留窗"放弃奖励"解围。"""
+    log(f"[广告{tag}] 未知广告形态 -> 计时后视觉找出口")
+    _ad_stay(tag)
+    if _try_door_exit(ow, oh, tag, DOOR_EXIT_CANDIDATES):
+        return True
+    return _rescue_giveup(ow, oh, tag)
+
+
+AD_HANDLERS = {
+    AD_FORM_PLAIN_DOOR: _handle_plain_door,
+    AD_FORM_MATERIAL_DOOR: _handle_material_door,
+    AD_FORM_LANDING_PAGE: _handle_landing_page,
+    AD_FORM_UNKNOWN: _handle_unknown_ad,
+}
+
+
+def handle_ad(tag="", entry_shot="_fs_entry.png"):
+    """广告形态分发器: 识别形态 -> 分派到 AD_HANDLERS 对应 handler。
+    返回是否成功回到金币中心。"""
+    changed, used, d, _ = wait_change(entry_shot, timeout=4.0)
+    log(f"[广告{tag}] 入口点击后 {used:.1f}s 页面{'已跳转' if changed else '没变化'}")
+
+    if is_door_page():
+        stay = random.uniform(*DOOR_STAY_RANGE)
+        log(f"[广告{tag}] 门页停留 {stay:.2f}s")
+        time.sleep(stay)
+        ow, oh = screen_size("_fs_door.png")
+        if is_plain_door():
+            form = AD_FORM_PLAIN_DOOR
+        else:
+            form = AD_FORM_MATERIAL_DOOR
+    else:
+        form = AD_FORM_LANDING_PAGE
+        ow, oh = screen_size(entry_shot)
+
+    log(f"[广告{tag}] 形态={form}")
+    handler = AD_HANDLERS.get(form, AD_HANDLERS[AD_FORM_UNKNOWN])
+    return handler(ow, oh, tag)
+
+
+def run_ad_once(tag="", entry_shot="_fs_entry.png"):
+    """兼容包装: 等价于 handle_ad。保留函数名, 调用点(run_round/run_task2_round)零改动。"""
+    return handle_ad(tag=tag, entry_shot=entry_shot)
 
 
 def run_incentive_chain(max_n=6, tag=""):
