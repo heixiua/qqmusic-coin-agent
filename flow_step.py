@@ -1013,10 +1013,18 @@ def _close_landing_x(ow, oh, tag, check=None):
 
 
 def _ad_stay(tag):
-    """广告/落地页停留(平台规则 15s 硬下限, 不能缩)。"""
+    """广告/落地页停留(平台规则 15s 硬下限, 不能缩)。
+    2026-11-03 新增: 停留期间轮询前台包, 若跳到外部应用(跳转门广告), 提前返回 "external"。"""
     stay = random.uniform(*AD_STAY_RANGE)
     log(f"[广告{tag}] 广告页停留 {stay:.2f}s")
-    time.sleep(stay)
+    t0 = time.time()
+    while time.time() - t0 < stay:
+        pkg = focus_package()
+        if pkg and pkg != "com.tencent.qqmusic":
+            log(f"[广告{tag}] 停留中检测到前台={pkg}(非QQ音乐) -> 跳转门广告")
+            return "external"
+        time.sleep(0.8)
+    return None
 
 
 def _countdown_running():
@@ -1035,7 +1043,8 @@ def _handle_video_reward(ow, oh, tag, check=None):
     -> 点顶部「退出」-> 出口链 -> 挽留窗。
     2026-11-03 教训: 30s 视频只等 17.5s 就去点"退出", 全部无效, 还误入抢救把奖励丢了。"""
     check = check or on_coin_center
-    _ad_stay(tag)
+    if _ad_stay(tag) == "external":
+        return _handle_external_jump(ow, oh, tag, check=check)
     for i in range(6):                      # 再给最多 ~36s, 覆盖 30s 长视频
         if check():
             return True
@@ -1114,7 +1123,8 @@ def _handle_plain_door(ow, oh, tag, check=None):
     出口优先黑条"退出"(实测 599,222), 跳过素材型右上角✕(纯白型没有, 每次白等 1.8s)。"""
     check = check or on_coin_center
     log(f"[广告{tag}] 纯白说明型门页 -> 不点 CTA, 直接计时")
-    _ad_stay(tag)
+    if _ad_stay(tag) == "external":
+        return _handle_external_jump(ow, oh, tag, check=check)
     log(f"[广告{tag}] 一直停在门页, 跳过落地页✕, 直接找门页出口")
     return _try_door_exit(ow, oh, tag, DOOR_EXIT_PLAIN, check=check)
 
@@ -1130,11 +1140,67 @@ def _handle_material_door(ow, oh, tag, check=None):
             log(f"[广告{tag}] CTA 点不动且有倒计时圆圈 -> 实为视频型广告, 降级视频流程")
             return _handle_video_reward(ow, oh, tag, check=check)
         log(f"[广告{tag}] CTA 没点动且无倒计时圆圈, 视为纯白型门页, 直接找门页出口")
-        _ad_stay(tag)
+        if _ad_stay(tag) == "external":
+            return _handle_external_jump(ow, oh, tag, check=check)
         if _try_door_exit(ow, oh, tag, DOOR_EXIT_CANDIDATES, check=check):
             return True
         return _rescue_giveup(ow, oh, tag, check=check)
-    _ad_stay(tag)
+    if _ad_stay(tag) == "external":
+        return _handle_external_jump(ow, oh, tag, check=check)
+    if _close_landing_x(ow, oh, tag, check=check):
+        return True
+    if _try_door_exit(ow, oh, tag, DOOR_EXIT_CANDIDATES, check=check):
+        return True
+    return _rescue_giveup(ow, oh, tag, check=check)
+
+
+def _try_download_jump(ow, oh, tag):
+    """落地页找「立即下载」按钮(跳转门广告特征): 找到则点击, 返回是否已跳转外部应用。
+    跳转门(2026-11-03 用户确认): 点「立即下载」-> 应用商店/浏览器 -> 外部停留15s
+    -> 回QQ音乐 -> 右上角X -> 回金币中心。按钮位置随广告变化, 用 VLM 定位。"""
+    if vlm_locate is None:
+        log(f"[广告{tag}] vlm_locate 不可用, 跳过'立即下载'检测")
+        return False
+    shot = "_fs_dl.png"
+    screencap(shot)
+    got = vlm_locate.locate(shot, "立即下载或下载按钮(通常在页面最底部)", ow, oh, tag=f"{tag}-下载")
+    if not got:
+        log(f"[广告{tag}] 页面无「立即下载」按钮 -> 按普通落地页处理")
+        return False
+    x, y, info = got
+    screencap("_fs_dl2.png")
+    if _dist(_fp(shot), _fp("_fs_dl2.png")) > 6.0:
+        log(f"[广告{tag}] 等模型期间页面已变化, 放弃点击")
+        return False
+    log(f"[广告{tag}] 找到「立即下载」({x},{y}) -> 点击触发跳转门")
+    tap_human(x, y)
+    time.sleep(2.5)
+    pkg = focus_package()
+    if pkg and pkg != "com.tencent.qqmusic":
+        log(f"[广告{tag}] 已跳转外部应用({pkg}) -> 跳转门")
+        return True
+    log(f"[广告{tag}] 点了「立即下载」但未跳外部, 按落地页继续")
+    return False
+
+
+def _handle_external_jump(ow, oh, tag, check=None):
+    """跳转门广告(2026-11-03 用户确认流程):
+    点「立即下载」-> 跳到应用商店/浏览器 -> 外部停留15s(任务在QQ音乐后台计时)
+    -> 回QQ音乐 -> 广告页右上角X -> 回金币中心。"""
+    check = check or on_coin_center
+    stay = random.uniform(*AD_STAY_RANGE)
+    log(f"[广告{tag}] 跳转门: 外部停留 {stay:.2f}s (任务在QQ音乐后台计时)")
+    time.sleep(stay)
+    # 回 QQ音乐: 应用商店/浏览器可能多层页面, BACK 最多3次
+    for _ in range(3):
+        pkg = focus_package()
+        if not pkg or pkg == "com.tencent.qqmusic":
+            break
+        back()
+        time.sleep(2.2)
+    if check():
+        return True
+    # 回QQ音乐后可能还在广告页: 左上✕ -> 出口链 -> 放弃奖励
     if _close_landing_x(ow, oh, tag, check=check):
         return True
     if _try_door_exit(ow, oh, tag, DOOR_EXIT_CANDIDATES, check=check):
@@ -1146,7 +1212,12 @@ def _handle_landing_page(ow, oh, tag, check=None):
     """落地页ADActivity(入口点击后直接进广告落地页, 没有门页): 计时 -> 落地页✕ -> 门页出口。"""
     check = check or on_coin_center
     log(f"[广告{tag}] 不是门页, 视为已在广告/落地页")
-    _ad_stay(tag)
+    # 跳转门(2026-11-03): 先找「立即下载」按钮, 点了会跳应用商店/浏览器
+    if _try_download_jump(ow, oh, tag):
+        return _handle_external_jump(ow, oh, tag, check=check)
+    ext = _ad_stay(tag)
+    if ext == "external":
+        return _handle_external_jump(ow, oh, tag, check=check)
     if _close_landing_x(ow, oh, tag, check=check):
         return True
     if _try_door_exit(ow, oh, tag, DOOR_EXIT_CANDIDATES, check=check):
@@ -1158,7 +1229,8 @@ def _handle_unknown_ad(ow, oh, tag, check=None):
     """未知形态兜底: 计时 -> 视觉找退出; 再不行按挽留窗"放弃奖励"解围。"""
     check = check or on_coin_center
     log(f"[广告{tag}] 未知广告形态 -> 计时后视觉找出口")
-    _ad_stay(tag)
+    if _ad_stay(tag) == "external":
+        return _handle_external_jump(ow, oh, tag, check=check)
     if _try_door_exit(ow, oh, tag, DOOR_EXIT_CANDIDATES, check=check):
         return True
     return _rescue_giveup(ow, oh, tag, check=check)
