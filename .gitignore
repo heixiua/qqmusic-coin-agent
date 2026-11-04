@@ -38,3 +38,24 @@ d.xml
 dd.xml
 task2.xml
 flow_step.bak_*.py
+
+# ===== 内部文档与旧架构(本地保留, 不公开到 GitHub) =====
+flow_step.py
+flow_step_backup_20261103_1955.py
+项目交接文档.md
+扒流程方法论.md
+
+# ===== 历史模板(flow_manual 运行时仅需 tpl_incentive_fixed/next_btn/lot_watch/lot_draw) =====
+tpl_draw_row.png
+tpl_incentive_btn.png
+tpl_lottery_draw.png
+tpl_lottery_free.png
+tpl_lottery_tomorrow.png
+tpl_ok_btn.png
+tpl_task2_row.png
+tpl_timed_row.png
+
+# ===== 归档运行日志/截图(本地复盘留档, 不公开) =====
+run_第一次/
+run_第二次/
+view.html
