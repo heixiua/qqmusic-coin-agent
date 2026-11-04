@@ -21,15 +21,20 @@ import re
 import subprocess
 import time
 
-from PIL import Image
+from PIL import Image, ImageOps, ImageEnhance
 import numpy as np
+import pytesseract
 
 # ================= 基础环境 =================
 ADB = r"D:\桌面\xdf\Agent工程与具身智能\安卓手机控制\platform-tools\platform-tools\adb.exe"
 QQMUSIC = "com.tencent.qqmusic"
+TESSERACT_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"  # 本地 Tesseract OCR(金币中心是WebView, uiautomator拿不到文字)
 
 # ================= 已确认的坐标(相对 0~1000) =================
 COIN_VIDEO_BTN_REL = (833, 685)    # 金币中心: "看视频领金币"右侧橙色"看视频"按钮
+COIN_BTN_REGION_PX = (810, 1560, 972, 1704)  # 顶部「看视频」按钮区域(像素), 完成态判断用: 该区域还在=按钮还在=没跳广告
+COIN_NO_AD_MAX = 3                 # 看视频领金币完成态: 点看视频连续3次没跳广告则判完成(用户2026-11-04定)
+COIN_BTN_DIFF_THRESHOLD = 30.0     # 看视频按钮区域像素差异阈值: >阈值=按钮区域变化(进广告), <阈值=按钮还在(没跳广告)
 DOOR_CTA_REL = (500, 895)          # 门页: 底部蓝色"点击浏览15秒"(京东型, y≈2147)
 DOOR_CTA_CANDIDATES = [            # 门页 CTA 有几种位置, 按顺序试, 每次试完校验页面是否变化
     (500, 895),                    # 京东型: "点击浏览15秒" 蓝色文字 (y≈2147)
@@ -142,6 +147,37 @@ def swipe_left(ow=None, oh=None, duration=250):
     log("  左滑")
 
 
+def swipe_up(ow=None, oh=None, duration=300):
+    """向上滚动(手指从下往上, 内容上移/看下面内容)。金币中心找下面的任务入口用。"""
+    if ow is None or oh is None:
+        screencap(TMP)
+        with Image.open(TMP) as im:
+            ow, oh = im.size
+    _adb("shell", "input", "swipe", str(int(ow * 0.5)), str(int(oh * 0.85)),
+         str(int(ow * 0.5)), str(int(oh * 0.15)), str(duration))
+    log("  向上滚动一屏")
+
+
+def swipe_down(ow=None, oh=None, duration=300):
+    """向下滚动(手指从上往下, 内容下移/回看上面内容)。与 swipe_up 配套还原页面。"""
+    if ow is None or oh is None:
+        screencap(TMP)
+        with Image.open(TMP) as im:
+            ow, oh = im.size
+    _adb("shell", "input", "swipe", str(int(ow * 0.5)), str(int(oh * 0.15)),
+         str(int(ow * 0.5)), str(int(oh * 0.85)), str(duration))
+    log("  向下滚动一屏")
+
+
+def scroll_to_top(reps=3):
+    """金币中心任务列表滚回顶部: 连续向下滚(手指从上往下=回看上面) reps 次。
+    从滚动一屏后的高额金币入口位置回顶部, 3 次足够(每次一屏, 顶部多余滚动自动到边界)。"""
+    for _ in range(reps):
+        swipe_down()
+        time.sleep(0.8)
+    log("  已滚回顶部")
+
+
 def focus_package():
     out = _adb("shell", "dumpsys window | grep -E 'mCurrentFocus|mFocusedApp'")
     m = re.search(r"([a-zA-Z][\w.]+)/[\w.$]+", out)
@@ -183,6 +219,15 @@ def step1_watch_video():
     log(f"[第1步] 屏幕 {ow}x{oh}, 点「看视频」入口 ({x},{y})")
     tap(x, y)
     log("[第1步] 已点击")
+
+
+def _btn_region_diff(ref_shot, cur_shot):
+    """比较两张截图在顶部「看视频」按钮区域(COIN_BTN_REGION_PX)的像素差异均值。
+    用于完成态判断: 点看视频后若该区域仍与金币中心参考一致(差异小)=看视频按钮还在=没跳广告;
+    区域变化大=进入广告页(按钮消失)。"""
+    r1 = np.asarray(Image.open(ref_shot).convert("RGB").crop(COIN_BTN_REGION_PX), dtype=np.int16)
+    r2 = np.asarray(Image.open(cur_shot).convert("RGB").crop(COIN_BTN_REGION_PX), dtype=np.int16)
+    return float(np.abs(r1 - r2).mean())
 
 
 # ================= 跳转广告页出门方案 =================
@@ -267,10 +312,13 @@ def read_plain_door_text():
     rr = subprocess.run([ADB, "shell", "cat", "/sdcard/ui.xml"], capture_output=True, text=True)
     xml = rr.stdout
     pat = re.compile(r'text="([^"]+)"[^>]*?bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"')
+    texts = [m.group(1).strip() for m in pat.finditer(xml) if m.group(1).strip()]
+    log(f"[文字门页] dump 读到 {len(texts)} 段文字: " + "; ".join(texts[:30]))
     for m in pat.finditer(xml):
         t = m.group(1).strip()
-        if "观看广告" in t and "可获得奖励" in t:
-            sec_m = re.search(r"观看广告\s*(\d+)\s*秒", t)
+        # 单开门文字门页可能显示「观看广告XX秒」或「观看视频XX秒」(2026-11-04 实测出现"观看视频15秒")
+        if ("观看广告" in t or "观看视频" in t) and "可获得奖励" in t:
+            sec_m = re.search(r"观看(?:广告|视频)\s*(\d+)\s*秒", t)
             sec = int(sec_m.group(1)) if sec_m else None
             done = t.startswith("已观看")
             x1, y1, x2, y2 = (int(m.group(i)) for i in range(2, 6))
@@ -279,38 +327,97 @@ def read_plain_door_text():
             ty = (y1 + y2) // 2
             log(f"[文字门页] 读到: {t} | 秒数={sec} 完成={done} | 退出按钮约({tx},{ty})")
             return sec, done, t, (x1, y1, x2, y2), tx, ty
-    log("[文字门页] 未读到「观看广告XX秒,可获得奖励」文字 -> 非文字门页")
-    return None
+    log("[文字门页] dump 未读到「观看广告XX秒,可获得奖励」文字 -> 尝试 OCR 兜底")
+    return _read_plain_door_ocr()
+
+
+def _read_plain_door_ocr():
+    """dump 读不到时的 OCR 兜底(2026-11-04): 「观看广告XX秒+跳过」型单开门变体。
+    判单开门 = 顶部广告栏识别到「可获得奖励」+「跳过/退出」结构, 秒数不强求(用户2026-11-04:
+    出门统一停留31-32秒, 不依赖秒数识别)。返回 (秒数int|None, 已完成bool, text, box, 退出x, 退出y) 或 None。"""
+    shot = "_fs_door_ocr.png"
+    # dump 读不到后立即截图太早, 倒计时文字还没加载 -> 等1-2秒再截图 OCR
+    time.sleep(random.uniform(1.0, 2.0))
+    screencap(shot)
+    words = ocr_words(shot)
+    log(f"[文字门页OCR] 截图={shot} 识别到 {len(words)} 个词: " +
+        "; ".join(f"'{t}'@({cx},{cy})" for t, x1, y1, x2, y2, cx, cy in words))
+    top_words = [w for w in words if w[2] < 400]  # 顶部广告栏
+    # 退出/跳过按钮(顶部; 「跳过」到时间变「退出」同位置, OCR可能把「跳过」拆成「跳」+「过」)
+    skip_words = [w for w in top_words if any(k in w[0] for k in ("跳过", "退出", "跳", "过"))]
+    exit_pos = None
+    if skip_words:
+        exit_pos = (int(sum(w[5] for w in skip_words) / len(skip_words)),
+                    int(sum(w[6] for w in skip_words) / len(skip_words)))
+    log(f"[文字门页OCR] 退出/跳过按钮定位: {exit_pos} (候选{len(skip_words)}个)")
+    # psm7 整行识别顶部广告栏(提高整行识别率)
+    img = Image.open(shot).convert("RGB")
+    top_img = img.crop((0, 0, img.width, int(img.height * 0.35)))
+    top_img = top_img.resize((top_img.width * 2, top_img.height * 2), Image.LANCZOS)
+    top_img = ImageOps.grayscale(top_img)
+    top_img = ImageEnhance.Contrast(top_img).enhance(1.5)
+    line = pytesseract.image_to_string(top_img, lang="chi_sim", config="--psm 7").strip()
+    log(f"[文字门页OCR] 顶部psm7整行: '{line}'")
+    # 单开门判定: 顶部识别到「可获得奖励」+「跳过/退出」结构(秒数不强求)
+    has_reward = ("可获得奖励" in line) or any("可获得奖励" in w[0] for w in top_words)
+    has_skip = (exit_pos is not None) or ("跳过" in line or "退出" in line)
+    if not (has_reward and has_skip):
+        log("[文字门页OCR] 无「可获得奖励+跳过」单开门结构 -> 非文字门页")
+        return None
+    # 秒数: 尝试识别(可选; 出门统一停31-32秒, 识别不出返回 None)
+    sec = None
+    m = re.search(r"观看(?:广告|视频|广|证|告)\s*(\d+)\s*秒", line)
+    if m:
+        sec = int(m.group(1))
+    done = ("已观看" in line) or any("已观看" in w[0] for w in top_words)
+    box = (0, 0, img.width, int(img.height * 0.35))
+    tx, ty = exit_pos if exit_pos else (695, 213)
+    log(f"[文字门页OCR] 单开门结构命中: 秒数={sec} 完成={done} 退出=({tx},{ty})")
+    return sec, done, line, box, tx, ty
 
 
 def _plain_need_stay(sec):
     """广告要求秒数归档(带区间容错): 一进去可能倒计时变少(30变29),
     28-30 都按 30 算, 14-15 按 15, 9-10 按 10。确保停留到广告要求时长。"""
-    if sec >= 28:
+    if sec >= 25:   # 25-30 都停30秒(等1-2秒截图倒计时已走掉, 用户2026-11-04)
         return 30.0
-    if sec >= 14:
+    if sec >= 12:   # 12-15 停15秒(同理放宽)
         return 15.0
-    if sec >= 9:
+    if sec >= 8:    # 8-10 停10秒(同理放宽)
         return 10.0
     return float(sec)
 
 
-def plain_door_exit_flow():
+def plain_door_exit_flow(info):
     """单开门/纯白说明型门页出门(文字判断版, 2026-11-04):
-    读「观看广告XX秒后/已观看广告XX秒，可获得奖励｜退出」,
-       - 进行中(「观看广告XX秒后」): 停留到归档秒数(28-30都按30)+缓冲, 覆盖10/15/30秒
+    接收 door_entry_flow 已判定的 info(sec, done, text, box, tx, ty), 不再重新判断
+    (同一广告页 OCR 两次结果不稳定, 重新判断会产生「判单开门后又判非单开门」冲突)。
        - 已完成(「已观看广告XX秒」): 直接点「退出」
-    文字判断而非纯白页颜色判断(用户明确)。点「退出」用文本右端坐标。"""
-    info = read_plain_door_text()
+       - 进行中: 逐秒轮询读完成态, 读到「已观看」后等1-2秒确认广告真实播完再点退出
+         (用户2026-11-04: 不判断停留秒数, 读到「已观看/退出」就点退出; dump 完成文案可能
+         早于广告真实播完, 故读到后再等1-2秒确认; OCR 不稳定返回 None 时继续轮询不放弃)。"""
     if info is None:
         log("[文字门页] 不是文字门页, 不做出门")
         return False
     sec, done, text, box, tx, ty = info
-    if not done and sec:
-        need = _plain_need_stay(sec)
-        stay = need + random.uniform(1.0, 2.0)
-        log(f"[文字门页] 进行中(广告要求{sec}s, 归档{need:.0f}s), 停留 {stay:.1f}s 再点退出")
-        time.sleep(stay)
+    if not done:
+        # 逐秒轮询读完成态, 读到「已观看」后等1-2秒确认再点退出(用户2026-11-04)
+        deadline = time.time() + 45  # 上限45秒, 避免死循环
+        while time.time() < deadline:
+            time.sleep(1.0)
+            info2 = read_plain_door_text()
+            if info2 is not None and info2[1]:
+                confirm = random.uniform(1.0, 2.0)
+                log(f"[文字门页] 读到完成态({info2[2]}), 再等 {confirm:.1f}s 确认广告真实播完")
+                time.sleep(confirm)
+                info3 = read_plain_door_text()
+                if info3 is not None and info3[1]:
+                    sec, done, text, box, tx, ty = info3
+                    break
+                log("[文字门页] 完成态未稳定, 继续轮询")
+            # info2 为 None(OCR 不稳定)时继续轮询, 不放弃出门(2026-11-04)
+        if not done:
+            log(f"[文字门页] {45}秒内未读到稳定完成态, 兜底点退出")
     log(f"[文字门页] 点「退出」({tx},{ty})")
     tap(tx, ty)
     time.sleep(1.5)
@@ -324,12 +431,17 @@ def door_entry_flow():
           跳外部(应用商店/浏览器) -> ad_exit_flow(already_cta=True, 跳过点CTA)
           未跳转(仍在QQ音乐)     -> 停住待命"""
     # 1) 先文字判断是否单开门(「观看XX秒」文字门页)
-    if read_plain_door_text() is not None:
-        log("[进门分流] 单开门文字门页 -> 走单开门出门(停留到秒数+点退出)")
-        plain_door_exit_flow()
+    info = read_plain_door_text()
+    if info is not None:
+        log("[进门分流] 单开门文字门页 -> 走单开门出门")
+        plain_door_exit_flow(info)
         return "plain"
-    # 2) 双开门: 点门页 CTA
-    log("[进门分流] 非单开门 -> 按双开门处理: 点门页 CTA")
+    # 2) 非单开门: 先判断是否真广告门页(区分红包雨等非广告, 用户2026-11-04)
+    if not _detect_ad_cta():
+        log("[进门分流] 非广告门页(红包雨等) -> 不点CTA, 判没刷广告")
+        return "not_ad"
+    # 3) 双开门: 点门页 CTA
+    log("[进门分流] 广告门页(双开门) -> 点门页 CTA")
     screencap("_fs_cta.png")
     ow, oh = screen_size("_fs_cta.png")
     x = int(DOOR_CTA_REL[0] / 1000 * ow)
@@ -341,8 +453,53 @@ def door_entry_flow():
         log("[进门分流] 已跳外部(应用商店/浏览器) -> 走跳转出门")
         ad_exit_flow(already_cta=True)
         return "external"
-    log("[进门分流] 仍在QQ音乐(未跳转) -> 停住待命")
+    log("[进门分流] 仍在QQ音乐(未跳转) -> 停16-17秒 -> 左滑 -> 点右上角X(2026-11-04, 用户手动验证)")
+    stay = random.uniform(16.0, 17.0)
+    log(f"[进门分流] 未跳转, 停留 {stay:.2f}s")
+    time.sleep(stay)
+    log("[进门分流] 左滑")
+    swipe_left()
+    time.sleep(random.uniform(1.0, 1.5))
+    # 点右上角「✕」(同 ad_exit_flow, AD_DOOR_X_REL=922,110 -> 像素995,264)
+    screencap("_fs_x.png")
+    ow, oh = screen_size("_fs_x.png")
+    x = int(AD_DOOR_X_REL[0] / 1000 * ow)
+    y = int(AD_DOOR_X_REL[1] / 1000 * oh)
+    log(f"[进门分流] 屏幕 {ow}x{oh}, 点右上角「✕」 ({x},{y})")
+    tap(x, y)
+    time.sleep(1.0)
     return "normal"
+
+
+def _detect_ad_cta():
+    """用 OCR 屏幕内容判断当前是否广告门页(双开门CTA页)(2026-11-04):
+    WebView 广告页 uiautomator dump 读到的是金币中心(拿不到广告文字), 所以不依赖 dump,
+    直接截图 OCR 看当前屏幕是不是广告页。返回 True=广告门页(双开门), False=非广告页。
+    标志: 「可获得奖励」(金币中心任务列表无此文案) 或 「广告+正在/加载」(广告正在加载中)。
+    OCR 常拆词(「点击后浏览15秒可获得奖励」→拆单字), 所以用词组合检测而非整词。"""
+    shot = "_fs_ad_cta.png"
+    screencap(shot)
+    words = ocr_words(shot)
+    # 1) 「可获得奖励」: 整词 或 「获得」+「奖励」同行组合
+    has_reward = any(("可获得奖励" in w[0]) or (("获得" in w[0]) and ("奖励" in w[0])) for w in words)
+    if not has_reward:
+        for w in words:
+            t, y1 = w[0], w[2]
+            if "获得" in t or "奖励" in t:
+                for w2 in words:
+                    t2, y2 = w2[0], w2[2]
+                    if abs(y2 - y1) < 60 and ((("获得" in t) and ("奖励" in t2)) or (("奖励" in t) and ("获得" in t2))):
+                        has_reward = True
+                        break
+                if has_reward:
+                    break
+    # 2) 「广告正在加载中」: 同时有「广告」词 和「正在/加载」词
+    has_ad_word = any("广告" in w[0] for w in words)
+    has_loading = any(("加载" in w[0]) or ("正在" in w[0]) for w in words)
+    ok = has_reward or (has_ad_word and has_loading)
+    log(f"[广告门页] OCR: 可获得奖励={has_reward} 广告词={has_ad_word} 加载词={has_loading} -> "
+        f"{'广告门页(双开门)' if ok else '非广告页'}")
+    return ok
 
 
 def find_popup(shot="_fs_popup.png"):
@@ -423,6 +580,230 @@ def is_external_jump():
     return jumped
 
 
+# ================= Tesseract OCR 文字识别(金币中心是 WebView, uiautomator dump 拿不到文字) =================
+def ocr_words(shot):
+    """用本地 Tesseract OCR 识别截图, 返回 [(text, x1,y1,x2,y2, cx,cy), ...]。
+    金币中心任务列表是 WebView, dump 拿不到文字, 用 Tesseract(chi_sim) 识别+取词坐标。
+    预处理: 放大2x + 灰度 + 对比度增强(实测原图识别不出橙色按钮上的「领金币」,
+    2x 后能识别出「领」+「金币」, 2026-11-04)。坐标按 scale 还原。"""
+    pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
+    img = Image.open(shot).convert("RGB")
+    scale = 2
+    big = img.resize((img.width * scale, img.height * scale), Image.LANCZOS)
+    gray = ImageOps.grayscale(big)
+    gray = ImageEnhance.Contrast(gray).enhance(1.5)
+    data = pytesseract.image_to_data(gray, lang="chi_sim",
+                                     output_type=pytesseract.Output.DICT)
+    words = []
+    n = len(data["text"])
+    for i in range(n):
+        t = (data["text"][i] or "").strip()
+        if not t:
+            continue
+        x, y = data["left"][i] // scale, data["top"][i] // scale
+        w, h = data["width"][i] // scale, data["height"][i] // scale
+        words.append((t, x, y, x + w, y + h, x + w // 2, y + h // 2))
+    return words
+
+
+def find_watch_video_btn(shot):
+    """OCR 找「看视频得高额金币」任务右侧的「看视频」按钮, 返回中心 (cx,cy) 或 None。
+    页面有两个「看视频」: 标题「看视频得高额金币」在左侧(x<500), 按钮在右侧(x>800)。
+    按钮可能被 OCR 切成一词「看视频」或两词「看」+「视频」, 都处理。"""
+    words = ocr_words(shot)
+    # 情况1: 单个词「看视频」且在右侧
+    for t, x1, y1, x2, y2, cx, cy in words:
+        if ("看视频" in t and cx > 800) or (t == "看" and cx > 800):
+            # 若是「看」, 找紧随其后的「视频」合并
+            if t == "看":
+                for t2, a1, b1, a2, b2, c2x, c2y in words:
+                    if t2 == "视频" and abs(b1 - y1) < 60 and a1 > x1:
+                        return (x1 + a2) // 2, (y1 + b2) // 2
+            return cx, cy
+    return None
+
+
+def find_tomorrow_text(shot):
+    """OCR 找「明日再来」(任务完成态, 看视频按钮变灰点击无反应), 返回中心或 None。"""
+    for t, x1, y1, x2, y2, cx, cy in ocr_words(shot):
+        if "明日" in t or "再来" in t:
+            return cx, cy
+    return None
+
+
+def find_watch_coin_btn(shot, max_y=900):
+    """OCR 找金币中心顶部【看视频领金币】右侧「看视频」按钮(完成态=按钮消失)。
+    顶部看视频领金币按钮 y<max_y; 高额金币按钮在滚动后(y>max_y)。
+    返回中心 (cx,cy) 或 None(按钮消失=任务完成)。"""
+    for t, x1, y1, x2, y2, cx, cy in ocr_words(shot):
+        if ("看视频" in t or t == "看") and cx > 800 and cy < max_y:
+            return cx, cy
+    return None
+
+
+def high_coin_locate():
+    """从金币中心顶部向下滚动一屏, 定位【看视频得高额金币】入口(2026-11-04):
+    滚动一屏只做一次(定位入口), OCR 找右侧「看视频」按钮, 找到即定位成功。
+    返回按钮位置 (cx,cy) 或 None(滚动后未见入口)。"""
+    log("[高额金币-定位] 从顶部向下滚动一屏")
+    swipe_up()
+    time.sleep(1.0)
+    screencap("_fs_high_locate.png")
+    pos = find_watch_video_btn("_fs_high_locate.png")
+    if pos is None:
+        log("[高额金币-定位] 滚动一屏后未找到「看视频」入口按钮")
+    else:
+        log(f"[高额金币-定位] 入口定位成功: 看视频按钮 ({pos[0]},{pos[1]})")
+    return pos
+
+
+def locate_high_coin_btn(shot="_fs_high_btn.png"):
+    """OCR 定位【看视频得高额金币】按钮(2026-11-04): 按钮文字(看视频/领金币)OCR 识别不稳定,
+    但标题行「看视频得高额金币 每天+1000」识别稳定。按钮在同一行右侧且 x 固定(~855),
+    所以只识别标题行的 y, 返回 (855, 标题行cy)。不依赖滚动到精确位置(标题行实时OCR)。
+    返回 (cx,cy) 或 None(滚动后未见入口/未识别到标题行)。"""
+    words = ocr_words(shot)
+    ty = None
+    # 标题行特征: 「得高额」或「+1000」或「每天+1000」 (高额金币专属, 避免误识别顶部看视频领金币)
+    for t, x1, y1, x2, y2, cx, cy in words:
+        if ("得高额" in t) or ("+1000" in t) or ("每天" in t):
+            ty = cy
+            break
+    # 兜底: 「看视频」/「视频」+ 同行右侧「得」(看视频得高额金币 拆词)
+    if ty is None:
+        for t, x1, y1, x2, y2, cx, cy in words:
+            if ("看视频" in t or "视频" in t) and cx < 500:
+                for t2, a1, b1, a2, b2, c2x, c2y in words:
+                    if ("得高额" in t2 or "高额" in t2 or "1000" in t2) and abs(b1 - y1) < 60:
+                        ty = cy
+                        break
+                if ty is not None:
+                    break
+    if ty is None:
+        log("[高额金币-定位] OCR 未识别到「看视频得高额金币」标题行")
+        return None
+    log(f"[高额金币-定位] 标题行 y={ty}, 按钮=(855,{ty})")
+    return 855, ty
+
+
+def find_high_coin_btn(shot):
+    """一次 OCR 定位【看视频得高额金币】右侧按钮, 返回 (cx,cy,kind) 或 None。
+    标题「看视频得高额金币」OCR 会拆词(如「看」「视频」「得」「高」「额」「金币」), 锁定行
+    用左侧「视频」(cx<500); 右侧按钮文字也拆词(「领」+「金币」/「看」+「视频」), 合并处理。
+    kind: watch=「看视频」/ claim=「领金币」/ done=「明日再来」。按钮同一位置文字随状态变。"""
+    words = ocr_words(shot)
+    ty1 = ty2 = None
+    # 1) 标题锁定行: 先整词, 再「视频」cx<500(校验同行右侧有「得」), 再「高额」
+    for t, x1, y1, x2, y2, cx, cy in words:
+        if "看视频得高额金币" in t and cx < 500:
+            ty1, ty2 = y1, y2
+            break
+    if ty1 is None:
+        for t, x1, y1, x2, y2, cx, cy in words:
+            if "视频" in t and cx < 500:
+                for t2, a1, b1, a2, b2, c2x, c2y in words:
+                    if t2 == "得" and abs(b1 - y1) < 40 and a1 > x1:
+                        ty1, ty2 = y1, y2
+                        break
+                if ty1 is not None:
+                    break
+    if ty1 is None:
+        for t, x1, y1, x2, y2, cx, cy in words:
+            if ("高额" in t or "+1000" in t) and cx < 500:
+                ty1, ty2 = y1, y2
+                break
+    # 2) 标题行右侧(x>800)按钮文字, 处理拆词
+    for t, x1, y1, x2, y2, cx, cy in words:
+        if cx > 800 and (ty1 is None or (y1 >= ty1 - 25 and y2 <= ty2 + 25)):
+            if "领金币" in t:
+                return cx, cy, "claim"
+            if "明日" in t or "再来" in t:
+                return cx, cy, "done"
+            if "看视频" in t:
+                return cx, cy, "watch"
+            if t == "领":  # 「领」+「金币」拆词
+                for t2, a1, b1, a2, b2, c2x, c2y in words:
+                    if "金币" in t2 and abs(b1 - y1) < 40 and a1 > x1:
+                        return (x1 + a2) // 2, (y1 + b2) // 2, "claim"
+                # 兜底: 该行右侧按钮只可能是三态之一, 找不到「金币」也直接判 claim
+                return cx, cy, "claim"
+            if t == "看":  # 「看视频」拆词; OCR 常把「视」误识别成「钢/频」, 第一个字「看」即锁 watch
+                # (2026-11-04: 实测右侧识别成「看」+「钢」+「频」, 原逻辑找「视频」匹配不上 -> 误判找不到按钮)
+                return cx, cy, "watch"
+    return None
+
+
+def high_coin_task(max_tries=8, roll_top_each=False):
+    """【看视频得高额金币】批量跑(2026-11-04 改版): 按钮文字(看视频/领金币)OCR 识别不稳定,
+    改「标题行定位 + 行为判断」: 点按钮(855, 标题行y) -> 停3s -> 判断:
+      进广告门页(单/双开门) -> door_entry_flow 出门(复用看视频领金币) -> 下一轮按钮变「领金币」
+      弹激励/观看下一条 -> find_popup -> incentive/next 出门 -> 下一轮按钮变回「看视频」
+      点按钮无广告无激励(连续3次) -> 「明日再来」= 任务完成
+    roll_top_each=True: 每轮滚回顶部+滚动一屏再定位(测试用, 验证滚动稳定性);
+       False=直接在入口连续跑(定位一次后按钮位置固定)。"""
+    no_adv_count = 0
+    for t in range(1, max_tries + 1):
+        stay = random.uniform(2.0, 3.0)
+        log(f"[高额金币] 第{t}轮前停 {stay:.2f}s(等领取成功弹窗消失)")
+        time.sleep(stay)
+        if roll_top_each:
+            log(f"[高额金币] 第{t}轮: 滚回顶部+滚动一屏")
+            scroll_to_top()
+            time.sleep(1.0)
+            swipe_up()
+            time.sleep(1.0)
+        screencap("_fs_high_btn.png")
+        pos = locate_high_coin_btn("_fs_high_btn.png")
+        if pos is None:
+            # 定位失败: 可能完成态(明日再来)或滚动位置不对 -> 滚顶重定位一次
+            if find_tomorrow_text("_fs_high_btn.png") is not None:
+                log(f"[高额金币] 第{t}轮发现「明日再来」 -> 任务完成")
+                return True
+            log(f"[高额金币] 第{t}轮定位按钮失败, 滚回顶部重试")
+            scroll_to_top()
+            time.sleep(1.0)
+            swipe_up()
+            time.sleep(1.0)
+            screencap("_fs_high_btn.png")
+            pos = locate_high_coin_btn("_fs_high_btn.png")
+            if pos is None:
+                if find_tomorrow_text("_fs_high_btn.png") is not None:
+                    log(f"[高额金币] 第{t}轮(重试)发现「明日再来」 -> 任务完成")
+                    return True
+                log(f"[高额金币] 第{t}轮重试后仍定位不到按钮 -> 停止")
+                return False
+        cx, cy = pos
+        log(f"[高额金币] 第{t}轮点击按钮 ({cx},{cy})")
+        tap(cx, cy)
+        time.sleep(3.0)
+        ret = door_entry_flow()
+        if ret != "not_ad":
+            no_adv_count = 0
+            log(f"[高额金币] 第{t}轮: 进广告出门({ret}) -> 按钮应变「领金币」")
+            continue
+        # not_ad: 没进广告 -> 领金币态(弹激励) 或 完成态(明日再来/点无反应)
+        popup = find_popup()
+        if popup and popup[0] == "incentive":
+            incentive_entry_flow()
+            no_adv_count = 0
+            log(f"[高额金币] 第{t}轮: 弹激励 -> 出门 -> 按钮应变「看视频」")
+            continue
+        if popup and popup[0] == "next":
+            next_entry_flow()
+            no_adv_count = 0
+            log(f"[高额金币] 第{t}轮: 弹观看下一条 -> 出门")
+            continue
+        # 无广告无激励 -> 点按钮无反应, 可能是完成态(明日再来)
+        no_adv_count += 1
+        log(f"[高额金币] 第{t}轮: 无广告无激励(第{no_adv_count}次) -> 判完成")
+        if no_adv_count >= 3:
+            log(f"[高额金币] 连续{no_adv_count}次无反应 -> 任务完成")
+            return True
+    log("[高额金币] 多轮未到完成态, 停止")
+    return False
+
+
+
 # ================= 激励跳转广告出门方案 =================
 def incentive_jump_ad_flow():
     """激励跳转广告出门方案(2026-11-04 用户确认): 点完激励入口后这次也跳转到应用商店
@@ -488,43 +869,59 @@ def next_entry_flow():
 
 
 def main(max_rounds=4):
-    """看视频领金币 全流程(2026-11-04 串联分流):
-    启动先 find_popup 判断当前页面, 避免盲点:
-      - 当前已是 激励弹窗/观看下一条 -> 直接走对应流程(不再点看视频)
-      - 当前无弹窗(应在金币中心)   -> step1 点看视频 -> ad_exit_flow 出门
-    出门后循环 find_popup 分流: 激励->incentive_entry_flow / 观看下一条->next_entry_flow,
-    直到无弹窗(max_rounds 兜底防死循环)。"""
-    first = find_popup()
-    if first is not None:
-        kind = first[0]
-        log(f"[全流程] 启动时已有弹窗({kind}), 直接走对应流程, 不点看视频")
-        if kind == "incentive":
-            r = incentive_entry_flow()
-        elif kind == "next":
-            r = next_entry_flow()
-        else:
-            log(f"[全流程] 未知弹窗 {first}, 停止")
-            return
-        log(f"[全流程] 启动弹窗处理结束: {r}")
-    else:
-        step1_watch_video()          # 任务入口: 点「看视频」
-        door_entry_flow()            # 进门统一分流: 单开门(文字门页)/双开门(点CTA判断跳转)
-    for i in range(1, max_rounds + 1):
+    """全流程串联(2026-11-04):
+    阶段1【看视频领金币】(金币中心顶部, 不需OCR, 点固定坐标833,685):
+      循环点看视频 -> 若进入广告走 door_entry_flow 出门 -> 直到连续 COIN_NO_AD_MAX 次
+      点看视频都没跳广告(看视频按钮区域不再变化) = 任务完成。
+      期间有激励/下一条弹窗先处理。
+    阶段2: swipe_up 滚动一屏 露出【看视频得高额金币】入口(需OCR定位).
+    阶段3【看视频得高额金币】: high_coin_task 循环 看视频->广告/领金币->激励
+      直到按钮「明日再来」= 完成。
+    前提: 运行前手机在金币中心顶部。"""
+    completed = False
+    # 阶段1: 点看视频 -> 连续 COIN_NO_AD_MAX 次没跳广告则判完成
+    screencap("_fs_phase1_ref.png")   # 金币中心参考: 顶部看视频按钮区域
+    no_ad = 0
+    ad_rounds = 0
+    while no_ad < COIN_NO_AD_MAX and ad_rounds < 20:
+        ad_rounds += 1
+        # 若当前有激励/下一条弹窗, 先处理
         popup = find_popup()
-        if popup is None:
-            log(f"[全流程] 第{i}轮无弹窗 -> 任务完成")
-            break
-        kind = popup[0]
-        if kind == "incentive":
-            log(f"[全流程] 第{i}轮: 激励弹窗")
-            r = incentive_entry_flow()
-        elif kind == "next":
-            log(f"[全流程] 第{i}轮: 观看下一条")
-            r = next_entry_flow()
+        if popup is not None:
+            kind = popup[0]
+            log(f"[看视频领金币] 第{ad_rounds}轮先处理弹窗({kind})")
+            if kind == "incentive":
+                incentive_entry_flow()
+            elif kind == "next":
+                next_entry_flow()
+            else:
+                log(f"[看视频领金币] 未知弹窗 {popup}, 停止")
+                return
+            continue
+        step1_watch_video()            # 任务入口: 点「看视频」(固定坐标, 不需OCR)
+        time.sleep(3.5)
+        result = door_entry_flow()     # 进门统一分流: 单开门/双开门/非广告(红包雨)
+        if result in ("plain", "external", "normal"):
+            # 走了单开门或双开门出门 = 刷到广告(用户2026-11-04: 完成判断靠「没走单开门/双开门」)
+            log(f"[看视频领金币] 第{ad_rounds}轮 走了广告出门({result}) -> 刷广告, no_ad清零")
+            no_ad = 0
         else:
-            log(f"[全流程] 第{i}轮: 未知弹窗 {popup}, 停止")
-            break
-        log(f"[全流程] 第{i}轮结束: {r}")
+            # not_ad(红包雨等, 没走单开门/双开门) -> 计一次没刷广告
+            no_ad += 1
+            log(f"[看视频领金币] 第{ad_rounds}轮 没走单开门/双开门({result}) -> no_ad={no_ad}/{COIN_NO_AD_MAX}")
+    if no_ad >= COIN_NO_AD_MAX:
+        log(f"[看视频领金币] 连续 {COIN_NO_AD_MAX} 次点看视频没跳广告 -> 任务完成")
+        completed = True
+    else:
+        log("[看视频领金币] 达到最大轮次仍有点广告, 未判完成, 停止")
+    if not completed:
+        log("[串联] 看视频领金币未正常完成, 不继续")
+        return
+    # ===== 阶段2: 滚动一屏 -> 高额金币入口 =====
+    log("[串联] 看视频领金币完成, 滚动一屏定位高额金币入口")
+    high_coin_locate()
+    # ===== 阶段3: 高额金币批量跑(OCR) =====
+    high_coin_task()
 
 
 if __name__ == "__main__":
