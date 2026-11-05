@@ -1,19 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-flow_manual.py — QQ音乐金币四任务的最新流程文件(由用户逐步带跑构建)。
-
-原则:
-    - 完全独立, 不 import flow_step.py(旧文件2000+行, 不再维护)。
-    - 本文件自带全部底层基础函数(adb/截图/点击/返回/左滑/前台检测/等待/日志)和
-      已经实测确认过的坐标常量, 是唯一要维护的小文件。
-    - 每一步"点哪里/点几下/停几秒"按用户逐步确认后固化, 每确认一步再追加一个步骤函数。
+flow_manual.py — QQ音乐金币四任务自动刷脚本(adb + 本地 OCR, 手机端运行)。
 
 用法:
-    python flow_manual.py            # 跑 main() 里已确认的步骤
+    python flow_manual.py            # 四任务串联跑(默认上限100轮)
+    python flow_manual.py 20         # 指定最大轮数
 
-当前已确认步骤:
-    [第1步] 金币中心 -> 点「看视频」按钮进广告
-    (后续步骤待用户逐步确认后追加)
+前提: 手机已连 adb 并处于金币中心顶部(「我的」→「领现金」进入, 顶部无弹窗)。
+
+说明: 所有按钮坐标/滚动量/模板图均为针对本机(vivo V2055A, 1080x2400)实测写死的像素值,
+      换手机/换QQ音乐版本后界面布局会变, 需按 README「手机适配」章节重新截图改坐标。
 """
 import os
 import random
@@ -26,26 +22,16 @@ import numpy as np
 import pytesseract
 
 # ================= 基础环境 =================
-ADB = r"D:\桌面\xdf\Agent工程与具身智能\安卓手机控制\platform-tools\platform-tools\adb.exe"
+ADB = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                   "platform-tools", "platform-tools", "adb.exe")
 QQMUSIC = "com.tencent.qqmusic"
 TESSERACT_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"  # 本地 Tesseract OCR(金币中心是WebView, uiautomator拿不到文字)
 
 # ================= 已确认的坐标(相对 0~1000) =================
 COIN_VIDEO_BTN_REL = (833, 685)    # 金币中心: "看视频领金币"右侧橙色"看视频"按钮
-COIN_BTN_REGION_PX = (810, 1560, 972, 1704)  # 顶部「看视频」按钮区域(像素), 完成态判断用: 该区域还在=按钮还在=没跳广告
 COIN_NO_AD_MAX = 3                 # 看视频领金币完成态: 点看视频连续3次没跳广告则判完成(用户2026-11-04定)
-COIN_BTN_DIFF_THRESHOLD = 30.0     # 看视频按钮区域像素差异阈值: >阈值=按钮区域变化(进广告), <阈值=按钮还在(没跳广告)
 DOOR_CTA_REL = (500, 895)          # 门页: 底部蓝色"点击浏览15秒"(京东型, y≈2147)
-DOOR_CTA_CANDIDATES = [            # 门页 CTA 有几种位置, 按顺序试, 每次试完校验页面是否变化
-    (500, 895),                    # 京东型: "点击浏览15秒" 蓝色文字 (y≈2147)
-    (500, 836),                    # 微信/公众号型: "去微信看看" 蓝色实心按钮 (y≈2007)
-]
-AD_GIVEUP_REL = (500, 641)         # 挽留窗"放弃奖励" (实测 y≈1538; 旧常量 670 会点偏)
-AD_WEBVIEW_X_REL = (150, 65)       # 广告落地页: 顶部左侧"✕" (京东热卖实测 162,155)
-AD_WEBVIEW_X2_REL = (129, 58)      # 备用: 老广告列表页的"✕" (实测 139,140)
 AD_DOOR_X_REL = (922, 110)         # 门页(恭喜已获得奖励): 右上角"✕" (实测 999,257)
-GIVEUP_BTN_REL = (500, 649)        # 任务奖励弹窗: 底部"放弃福利"按钮 (实测 2026-11-04, OCR中心)
-INCENTIVE_BTN_REL = (500, 519)     # 金币中心激励弹窗: 橙色按钮(备用, 主用扫描)
 INCENTIVE_TPL = "tpl_incentive_fixed.png"  # 激励按钮固定文案模板(不含金额"浏览5秒再领", 跨金额稳定, 裁自2026-11-04)
 INCENTIVE_TPL_X = 372              # 激励按钮固定 x 起点(像素; 弹窗居中, 按钮横向固定)
 INCENTIVE_TPL_MAX_DIST = 15.0      # 模板匹配阈值(激励固定文案模板真匹配差异≈0.0)
@@ -54,15 +40,6 @@ NEXT_TPL = "tpl_next_btn.png"       # 「观看下一条」按钮模板(双模�
 NEXT_TPL_X = 390                    # 「观看下一条」按钮固定 x 起点(像素; 中心≈544)
 NEXT_TPL_MAX_DIST = 15.0            # 观看下一条模板匹配阈值
 NEXT_TPL_Y_RANGE = (1360, 1440)     # 「观看下一条」按钮命中中心 y 区间(实测 y≈1402; 位置不符=跨匹配排除)
-# 单开门/纯白说明型门页(2026-11-04 新增): 点入口后进纯白页, 无CTA可点, 停满时长平台发奖励
-#   出口候选链 copy 旧代码 DOOR_EXIT_PLAIN(黑条「退出」优先, 实测599,222)
-DOOR_PLAIN_STAY_RANGE = (31.0, 32.0)            # 纯白页/单开门停留时长(用户确认31~32s, 时长会变需关注)
-DOOR_PLAIN_EXIT_CANDIDATES = [(556, 93), (622, 89), (438, 93), (500, 659)]
-
-# ================= 已确认的停留时长(秒) =================
-DOOR_STAY_RANGE = (2.0, 5.0)       # 门页停留(随机), 之后点 CTA
-AD_STAY_RANGE = (16.0, 18.5)       # 跳转后在广告页停留 —— 广告任务本身要求的 15 秒, 不能缩
-INCENTIVE_STAY_RANGE = (5.0, 6.0)  # 激励浏览页停留: 页面写的是"浏览5秒", 5 秒是硬下限
 
 TMP = "_fs_tmp.png"
 
@@ -90,44 +67,6 @@ def screen_size(path):
 def tap(x, y):
     _adb("shell", "input", "tap", str(int(x)), str(int(y)))
     log(f"  点击 ({int(x)},{int(y)})")
-
-
-def tap_human(x, y, jitter=8):
-    """更真实的点击: 坐标抖动 + DOWN/MOVE/UP 三段(带抖动轨迹与 80~180ms 按压时长)。
-    比 `input tap` 好: tap 只有一对 DOWN/UP, 且坐标每次完全一致, 是最容易被识别的脚本特征。
-    三段用**一次 shell** 发完(而不是三次 adb), 否则手势会被拆散、偶发不生效。"""
-    x = int(x) + random.randint(-jitter, jitter)
-    y = int(y) + random.randint(-jitter, jitter)
-    hold = random.uniform(0.08, 0.18)
-    dx1, dy1 = random.randint(-3, 3), random.randint(-3, 3)
-    dx2, dy2 = random.randint(-2, 2), random.randint(-2, 2)
-    cmd = (f"input motionevent DOWN {x} {y}; sleep {hold * 0.4:.2f}; "
-           f"input motionevent MOVE {x + dx1} {y + dy1}; sleep {hold * 0.35:.2f}; "
-           f"input motionevent UP {x + dx2} {y + dy2}")
-    _adb("shell", cmd)
-    log(f"  点击(拟人) ({x},{y}) 按压{hold * 1000:.0f}ms")
-
-
-def tap_verified(x, y, shot_before="_fs_vb.png", wait=1.6):
-    """拟人点击 -> 校验页面是否变化; 没变化就退回普通 tap 再试一次(防止 motionevent 不被接受)。
-    返回是否发生变化。"""
-    screencap(shot_before)
-    base = _fp(shot_before)
-    tap_human(x, y)
-    time.sleep(wait)
-    screencap("_fs_va.png")
-    d = _dist(base, _fp("_fs_va.png"))
-    if d >= 6.0:
-        log(f"  拟人点击生效 (差异{d:.0f})")
-        return True
-    log(f"  拟人点击没反应 (差异{d:.1f}), 退回普通 tap 重试")
-    tap(x, y)
-    time.sleep(wait)
-    screencap("_fs_va2.png")
-    d2 = _dist(base, _fp("_fs_va2.png"))
-    ok = d2 >= 6.0
-    log(f"  普通 tap {'生效' if ok else '仍无反应'} (差异{d2:.0f})")
-    return ok
 
 
 def back():
@@ -158,53 +97,10 @@ def swipe_up(ow=None, oh=None, duration=300):
     log("  向上滚动一屏")
 
 
-def swipe_down(ow=None, oh=None, duration=300):
-    """向下滚动(手指从上往下, 内容下移/回看上面内容)。与 swipe_up 配套还原页面。"""
-    if ow is None or oh is None:
-        screencap(TMP)
-        with Image.open(TMP) as im:
-            ow, oh = im.size
-    _adb("shell", "input", "swipe", str(int(ow * 0.5)), str(int(oh * 0.15)),
-         str(int(ow * 0.5)), str(int(oh * 0.85)), str(duration))
-    log("  向下滚动一屏")
-
-
-def scroll_to_top(reps=3):
-    """金币中心任务列表滚回顶部: 连续向下滚(手指从上往下=回看上面) reps 次。
-    从滚动一屏后的高额金币入口位置回顶部, 3 次足够(每次一屏, 顶部多余滚动自动到边界)。"""
-    for _ in range(reps):
-        swipe_down()
-        time.sleep(0.8)
-    log("  已滚回顶部")
-
-
 def focus_package():
     out = _adb("shell", "dumpsys window | grep -E 'mCurrentFocus|mFocusedApp'")
     m = re.search(r"([a-zA-Z][\w.]+)/[\w.$]+", out)
     return m.group(1) if m else ""
-
-
-def _fp(path):
-    """缩图灰度指纹, 用于粗判"页面有没有明显变化"。整屏比对会被视频动画污染, 只作粗判。"""
-    with Image.open(path) as im:
-        return im.convert("L").resize((60, 130)).tobytes()
-
-
-def _dist(a, b):
-    return sum(abs(p - q) for p, q in zip(a, b)) / (60 * 130)
-
-
-def wait_change(before_path, timeout=4.0, interval=0.5, th=6.0):
-    """轮询等页面变化。返回 (是否变化, 用时秒, 差异值, 变化时刻time.time())"""
-    base = _fp(before_path)
-    t0 = time.time()
-    while time.time() - t0 < timeout:
-        time.sleep(interval)
-        screencap(TMP)
-        d = _dist(base, _fp(TMP))
-        if d >= th:
-            return True, time.time() - t0, d, time.time()
-    return False, timeout, 0.0, 0.0
 
 
 # ================= 第1步: 金币中心 -> 点「看视频」进广告 =================
@@ -221,22 +117,13 @@ def step1_watch_video():
     log("[第1步] 已点击")
 
 
-def _btn_region_diff(ref_shot, cur_shot):
-    """比较两张截图在顶部「看视频」按钮区域(COIN_BTN_REGION_PX)的像素差异均值。
-    用于完成态判断: 点看视频后若该区域仍与金币中心参考一致(差异小)=看视频按钮还在=没跳广告;
-    区域变化大=进入广告页(按钮消失)。"""
-    r1 = np.asarray(Image.open(ref_shot).convert("RGB").crop(COIN_BTN_REGION_PX), dtype=np.int16)
-    r2 = np.asarray(Image.open(cur_shot).convert("RGB").crop(COIN_BTN_REGION_PX), dtype=np.int16)
-    return float(np.abs(r1 - r2).mean())
-
-
 # ================= 跳转广告页出门方案 =================
 def ad_exit_flow(already_cta=False):
     """跳转广告页出门方案(点完「看视频」进入广告后的全部动作, 由用户逐步确认):
     1) 停 2~3 秒随机 -> 点门页 CTA(DOOR_CTA_REL = 500,895)
     2) 停 17~18 秒随机 -> 左滑 3 次(每次间隔 0.8~1.3 秒随机; BACK 无效, 用户实测左滑)
     3) 停 1~1.5 秒随机 -> 点右上角「✕」(AD_DOOR_X_REL = 922,110)
-    4) 点任务奖励弹窗底部「放弃福利」(GIVEUP_BTN_REL = 500,649)
+    4) 点任务奖励弹窗底部「放弃福利」(先OCR定位, 兜底固定坐标 540,1557)
 
     注意: 点「看视频」这个入口动作不封装在这里, 由任务入口单独负责。
     already_cta=True: 调用方已点过门页 CTA, 跳过第 1) 步只做出门段(停17~18s->左滑->✕->放弃福利)。"""
@@ -285,27 +172,6 @@ def ad_exit_flow(already_cta=False):
 
 
 # ================= 页面判断 =================
-def is_plain_door(shot="_fs_plain.png", use_existing=False):
-    """判断当前是不是"纯白说明型门页"(单开门广告, 整页白底 + 灰字, 例如"点击允许打开微信/查看内容获取奖励")。
-    这种门页没有 CTA 按钮, 停满时长平台直接发奖励。判据用色彩饱和度(实测很干净):
-        素材型门页(京东大图): 饱和像素 ~34%, 亮度 106
-        纯白说明型:          饱和像素 0%,  亮度 253"""
-    if not use_existing:
-        screencap(shot)
-    a = np.asarray(Image.open(shot).convert("RGB")).astype(np.int16)
-    oh, ow, _ = a.shape
-    reg = a[int(0.28 * oh):int(0.62 * oh), int(0.05 * ow):int(0.95 * ow), :]
-    mx = reg.max(axis=2)
-    mn = reg.min(axis=2)
-    sat = (mx - mn) / np.maximum(mx, 1)
-    colorful = float((sat > 0.25).mean())
-    bright = float(reg.mean())
-    ok = bright > 235 and colorful < 0.03
-    log(f"[纯白页判定] 亮度 {bright:.0f} 彩色占比 {colorful:.1%} -> "
-        f"{'纯白说明型门页(单开门)' if ok else '非纯白'}")
-    return ok
-
-
 def read_plain_door_text():
     """用 uiautomator dump 读广告页文字, 匹配「观看广告XX秒后/已观看广告XX秒，可获得奖励」。
     返回 (秒数int, 已完成bool, text, 文本bounds盒, 点击x, 点击y) 或 None。
@@ -406,18 +272,6 @@ def _read_plain_door_ocr():
     tx, ty = exit_pos if exit_pos else (695, 213)
     log(f"[文字门页OCR] 单开门结构命中: 秒数={sec} 完成={done} 退出=({tx},{ty})")
     return sec, done, line, box, tx, ty
-
-
-def _plain_need_stay(sec):
-    """广告要求秒数归档(带区间容错): 一进去可能倒计时变少(30变29),
-    28-30 都按 30 算, 14-15 按 15, 9-10 按 10。确保停留到广告要求时长。"""
-    if sec >= 25:   # 25-30 都停30秒(等1-2秒截图倒计时已走掉, 用户2026-11-04)
-        return 30.0
-    if sec >= 12:   # 12-15 停15秒(同理放宽)
-        return 15.0
-    if sec >= 8:    # 8-10 停10秒(同理放宽)
-        return 10.0
-    return float(sec)
 
 
 def plain_door_exit_flow(info):
@@ -596,28 +450,6 @@ def find_popup(shot="_fs_popup.png"):
     return kind, cx, cy
 
 
-def find_incentive(shot="_fs_scan_inc.png"):
-    """模板匹配找金币中心激励弹窗的橙色按钮, 返回中心 (cx,cy) 或 None。
-    为什么固定 x: 激励弹窗居中, 按钮横向固定(x0≈372), 只有纵向随弹窗高度变, 所以固定 x 只扫 y。
-    注意: 按钮文字"浏览5秒再领XXX金币"的金额(XXX)会变, 若金额变化导致差异超阈值需裁剪不含金额的模板。"""
-    screencap(shot)
-    a = np.asarray(Image.open(shot).convert("L")).astype(np.int16)
-    tpl = np.asarray(Image.open(INCENTIVE_TPL).convert("L")).astype(np.int16)
-    oh, ow = a.shape
-    th, tw = tpl.shape
-    x0 = INCENTIVE_TPL_X
-    lo, hi = max(0, 1000), min(oh - th - 5, 1560)   # 弹窗按钮纵向范围
-    best_d, best_y = 999.0, -1
-    for y in range(lo, hi):
-        d = float(np.abs(a[y:y + th, x0:x0 + tw] - tpl).mean())
-        if d < best_d:
-            best_d, best_y = d, y
-    log(f"[激励检测] 模板最小差异 {best_d:.1f} @ y={best_y}")
-    if best_y < 0 or best_d > INCENTIVE_TPL_MAX_DIST:
-        return None
-    return int(x0 + tw / 2), best_y + th // 2
-
-
 def is_external_jump():
     """判断当前是否已跳转到外部应用(应用商店/浏览器等)。
     前台包 != QQ音乐 即认为跳转(QQ音乐的防脚本操作会把激励/广告带到应用商店)。
@@ -679,16 +511,6 @@ def find_tomorrow_text(shot):
     return None
 
 
-def find_watch_coin_btn(shot, max_y=900):
-    """OCR 找金币中心顶部【看视频领金币】右侧「看视频」按钮(完成态=按钮消失)。
-    顶部看视频领金币按钮 y<max_y; 高额金币按钮在滚动后(y>max_y)。
-    返回中心 (cx,cy) 或 None(按钮消失=任务完成)。"""
-    for t, x1, y1, x2, y2, cx, cy in ocr_words(shot):
-        if ("看视频" in t or t == "看") and cx > 800 and cy < max_y:
-            return cx, cy
-    return None
-
-
 def high_coin_locate():
     """从金币中心顶部向下滚动一屏, 定位【看视频得高额金币】入口(2026-11-04):
     滚动一屏只做一次(定位入口), OCR 找右侧「看视频」按钮, 找到即定位成功。
@@ -703,35 +525,6 @@ def high_coin_locate():
     else:
         log(f"[高额金币-定位] 入口定位成功: 看视频按钮 ({pos[0]},{pos[1]})")
     return pos
-
-
-def locate_high_coin_btn(shot="_fs_high_btn.png"):
-    """OCR 定位【看视频得高额金币】按钮(2026-11-04): 按钮文字(看视频/领金币)OCR 识别不稳定,
-    但标题行「看视频得高额金币 每天+1000」识别稳定。按钮在同一行右侧且 x 固定(~855),
-    所以只识别标题行的 y, 返回 (855, 标题行cy)。不依赖滚动到精确位置(标题行实时OCR)。
-    返回 (cx,cy) 或 None(滚动后未见入口/未识别到标题行)。"""
-    words = ocr_words(shot)
-    ty = None
-    # 标题行特征: 「得高额」或「+1000」或「每天+1000」 (高额金币专属, 避免误识别顶部看视频领金币)
-    for t, x1, y1, x2, y2, cx, cy in words:
-        if ("得高额" in t) or ("+1000" in t) or ("每天" in t):
-            ty = cy
-            break
-    # 兜底: 「看视频」/「视频」+ 同行右侧「得」(看视频得高额金币 拆词)
-    if ty is None:
-        for t, x1, y1, x2, y2, cx, cy in words:
-            if ("看视频" in t or "视频" in t) and cx < 500:
-                for t2, a1, b1, a2, b2, c2x, c2y in words:
-                    if ("得高额" in t2 or "高额" in t2 or "1000" in t2) and abs(b1 - y1) < 60:
-                        ty = cy
-                        break
-                if ty is not None:
-                    break
-    if ty is None:
-        log("[高额金币-定位] OCR 未识别到「看视频得高额金币」标题行")
-        return None
-    log(f"[高额金币-定位] 标题行 y={ty}, 按钮=(855,{ty})")
-    return 855, ty
 
 
 def find_high_coin_btn(shot):
@@ -785,14 +578,13 @@ def find_high_coin_btn(shot):
 HIGH_COIN_XY = (900, 1530)
 
 
-def high_coin_task(max_tries=20, roll_top_each=False):
-    """【看视频得高额金币】批量跑(2026-11-04 改版): 完成态=按钮文字变「明日再来」。
+def high_coin_task(max_tries=20):
+    """【看视频得高额金币】批量跑: 完成态=按钮文字变「明日再来」。
     每轮截图 OCR 按钮文字三态(watch/claim/done, 见 find_high_coin_btn):
       done「明日再来」 -> 任务完成
-      watch「看视频」/ claim「领金币」 -> 点按钮 -> 停3s -> door_entry_flow 分流出门
-    定位失败 -> 滚顶重试, 仍失败停止。max_tries 仅作安全上限(2026-11-05 用户调为15), 完成靠「明日再来」检测。
-    roll_top_each=True: 每轮滚回顶部+滚动一屏再定位(测试用, 验证滚动稳定性);
-       False=直接在入口连续跑(定位一次后按钮位置固定)。"""
+      watch「看视频」/ claim「领金币」 -> 点固定坐标(900,1530) -> 停3s -> scan_ad_and_exit 出门
+    每轮先全图找「明日再来」兜底判完成(按钮变灰后行内OCR识别不稳)。
+    max_tries 仅作安全上限(用户调为20), 完成靠「明日再来」检测。"""
     for t in range(1, max_tries + 1):
         stay = random.uniform(2.0, 3.0)
         log(f"[高额金币] 第{t}轮前停 {stay:.2f}s(等领取成功弹窗消失)")
@@ -842,63 +634,6 @@ def incentive_jump_ad_flow():
         swipe_left()
         time.sleep(random.uniform(0.8, 1.3))
     log("[激励跳转] 激励跳转广告出门方案执行完毕")
-
-
-def normal_incentive_flow():
-    """普通激励出门(2026-11-04 用户确认, 不跳外部): 点激励入口 -> 停5.5~6s -> 左滑。
-    注意: 点击激励入口由调用方完成(incentive_entry_flow 点击后判断未跳转才进本函数),
-    本函数只做「停留 -> 左滑」的出门动作, 做完不做任何操作。"""
-    stay = random.uniform(3.0, 4.0)   # 2026-11-05 用户: 普通激励左滑前停留3-4秒(原5.5~6s)
-    log(f"[普通激励] 停留 {stay:.2f}s")
-    time.sleep(stay)
-    swipe_left()
-    log("[普通激励] 已左滑, 普通激励出门执行完毕")
-
-
-def incentive_entry_flow():
-    """激励入口完整流程(2026-11-04): 判断是激励弹窗 -> 点击 -> 判断跳转 -> 分流出门。
-    先判断再点击(必须确认当前是激励弹窗才点, 防误触弹窗内嵌广告/误点其他橙色按钮)。
-    跳转外部 -> 激励跳转出门(停5.5~7s -> 左滑3次)。
-    不跳转(仍在QQ音乐) -> 普通激励出门(未搭建, 停住待命交给用户)。"""
-    popup = find_popup()
-    if not popup or popup[0] != "incentive":
-        log(f"[激励入口] 当前不是激励弹窗({popup}), 不点击")
-        return False
-    kind, cx, cy = popup
-    log(f"[激励入口] 确认激励弹窗, 点击 ({cx},{cy})")
-    tap(cx, cy)
-    time.sleep(3.0)
-    if is_external_jump():
-        log("[激励入口] 已跳外部(应用商店/浏览器) -> 走激励跳转出门")
-        incentive_jump_ad_flow()
-        return "external"
-    log("[激励入口] 仍在QQ音乐(未跳转) -> 检测是否单开门广告")
-    # 2026-11-04 用户定位根因: 激励广告升级防脚本, 点激励弹窗后进的是「单开门看视频」
-    # (微信授权页「已观看广告XX秒,可获得积分|退出」), 仍在QQ音乐前台被误走普通激励左滑,
-    # 但单开门左滑无效必须点退出。故未跳转时先检测单开门, 命中走单开门出门(点退出)。
-    door_info = read_plain_door_text()
-    if door_info is not None:
-        log("[激励入口] 激励弹窗后进单开门广告 -> 走单开门出门(点退出)")
-        plain_door_exit_flow(door_info)
-        return "plain"
-    log("[激励入口] 非单开门 -> 走普通激励出门(左滑)")
-    normal_incentive_flow()
-    return "normal"
-
-
-def next_entry_flow():
-    """观看下一条入口流程(2026-11-04): 判断观看下一条弹窗 -> 点击(=点看视频) -> 进门统一分流。
-    点观看下一条等同于点「看视频」, 进门后由 door_entry_flow 统一处理:
-    单开门(文字门页)->plain_door_exit_flow; 双开门->点CTA->判断跳转->出门/停住。"""
-    popup = find_popup()
-    if not popup or popup[0] != "next":
-        log(f"[观看下一条] 当前不是观看下一条弹窗({popup}), 不点击")
-        return False
-    kind, cx, cy = popup
-    log(f"[观看下一条] 确认弹窗, 点击 ({cx},{cy})  (=点看视频)")
-    tap(cx, cy)
-    time.sleep(3.0)
-    return scan_ad_and_exit()
 
 
 # ================= 统一广告扫描/出门封装(2026-11-04 三大任务共用) =================
@@ -1285,14 +1020,14 @@ def scan_ad_and_exit():
 
 
 def main(max_rounds=100):
-    """全流程串联(2026-11-04):
-    阶段1【看视频领金币】(金币中心顶部, 不需OCR, 点固定坐标833,685):
-      循环点看视频 -> 若进入广告走 door_entry_flow 出门 -> 直到连续 COIN_NO_AD_MAX 次
-      点看视频都没跳广告(看视频按钮区域不再变化) = 任务完成。
-      期间有激励/下一条弹窗先处理。
-    阶段2: swipe_up 滚动一屏 露出【看视频得高额金币】入口(需OCR定位).
-    阶段3【看视频得高额金币】: high_coin_task 循环 看视频->广告/领金币->激励
-      直到按钮「明日再来」= 完成。
+    """全流程串联:
+    阶段1【看视频领金币】(金币中心顶部, 点固定坐标833,685):
+      循环点看视频 -> scan_ad_and_exit 统一出门 -> 直到连续 COIN_NO_AD_MAX 次
+      点看视频都没跳广告 = 任务完成。期间有激励/下一条弹窗先处理。
+    阶段2: swipe_up 滚动一屏 露出【看视频得高额金币】入口.
+    阶段3【看视频得高额金币】: high_coin_task 循环点固定坐标(900,1530)
+      直到按钮「明日再来」= 完成.
+    阶段4【抽奖赢金币】: lottery_enter + lottery_task.
     前提: 运行前手机在金币中心顶部。"""
     completed = False
     # 阶段1: 点看视频 -> 连续 COIN_NO_AD_MAX 次没跳广告则判完成
@@ -1468,7 +1203,7 @@ def cleanup_temp():
     """跑完自动清理临时截图/调试脚本(2026-11-04), 避免 git 输出垃圾日志和照片。
     只删临时文件(_fs*.png / 调试脚本), 保留 flow_manual.py 与模板(tpl_*.png)。"""
     import glob
-    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(ADB))))
+    root = os.path.dirname(os.path.abspath(__file__))
     removed = 0
     for pat in ("_fs*.png", "_now.py", "_probe*.py", "_lot.py", "_probe_err.txt", "ui.xml"):
         for f in glob.glob(os.path.join(root, pat)):
